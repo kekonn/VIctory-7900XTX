@@ -4,13 +4,15 @@
 # -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
 # -Build        target\diag (the default, the build all measurements are of) or target\release
 # -More         other settings: -More @{VICTORY_PANEL='1'}
+# -Log          also write everything the runtime logs (its frame-rate and A/B lines) to that file: -Log ab-1.log
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
 param(
     [Parameter(Mandatory)][string]$Exe,
     [switch]$Safe,
     [switch]$RayTracing,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
-    [hashtable]$More = @{}
+    [hashtable]$More = @{},
+    [string]$Log
 )
 $settings = @{
     VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_RELAY = '2'; VICTORY_WIDE_BACK = '1'; VICTORY_CARD_REHASH_RUNS = '1'
@@ -41,5 +43,14 @@ if ($discarded) {
     Write-Host "Discarded inherited values for $($discarded.Name -join ', '). Use -More to pass them explicitly."
 }
 $Exe = (Resolve-Path $Exe).Path
+# (Relative to where it was started from, not the folder the run goes to.)
+if ($Log) { $Log = [IO.Path]::GetFullPath([IO.Path]::Combine((Get-Location).Path, $Log)); $env:NO_COLOR = '1' }
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
-try { & $victory run $Exe --execute } finally { Pop-Location }
+try {
+    if ($Log) {
+        # The runtime logs to stderr: taken in here with what it prints, as plain lines.
+        & $victory run $Exe --execute 2>&1 | ForEach-Object { "$_" } | Tee-Object -FilePath $Log
+    } else {
+        & $victory run $Exe --execute
+    }
+} finally { Pop-Location }
