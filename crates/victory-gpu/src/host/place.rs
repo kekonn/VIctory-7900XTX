@@ -245,7 +245,7 @@ impl HostList {
         let own = shaders_own(src, len);
         let scratch = match &own {
             Some(_) => None,
-            None if len <= MOST => match self.scratch_at(len as u64) {
+            None if len <= MOST => match self.scratch_at(len as u64, 256) {
                 Some(scratch) => Some(scratch),
                 None => return false,
             },
