@@ -1951,10 +1951,13 @@ impl Drop for Counted {
 }
 
 /// A chunk of upload memory for lists' scratch data: the buffer, its
-/// mapping.
+/// mapping and its host address, taken once when the chunk is made (a
+/// table's constant buffers asked the driver for it some 23,000 times a
+/// frame).
 struct Chunk {
     buffer: ID3D12Resource,
     data: usize,
+    gpu: u64,
 }
 
 // SAFETY: a D3D12 resource (free-threaded) and its persistent mapping,
@@ -2050,9 +2053,12 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
     name(&buffer, || "list scratch".into());
     ALIVE[1].fetch_add(1, Ordering::Relaxed);
     ALIVE[2].fetch_add(size, Ordering::Relaxed);
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     Some(Chunk {
         buffer,
         data: data as usize,
+        gpu,
     })
 }
 
@@ -7399,9 +7405,9 @@ impl HostList {
         // With [`card_steps`] the card may be the one that fills it: a
         // buffer of its own, as before.
         if card_steps::stage() <= 1 && size <= SCRATCH_CHUNK && upload_slices() {
-            let slice = self.scratch_at(size, PLACEMENT_ALIGN)?;
+            let (buffer, at, _, data) = self.scratch_at(size, PLACEMENT_ALIGN)?;
             SLICE_STATS[1].fetch_add(1, Ordering::Relaxed);
-            return Some(slice);
+            return Some((buffer, at, data));
         }
         let (buffer, data) = if card_steps::stage() > 1 { host.shared_buffer(size)? } else { host.upload_buffer(size)? };
         name(&buffer, || format!("list upload {size:#x}"));
@@ -7412,23 +7418,23 @@ impl HostList {
     /// `len` bytes of upload memory (256-byte aligned) until the list is
     /// reset: the host GPU address and the CPU pointer.
     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
-        let (buffer, at, data) = self.scratch_at(len, 256)?;
-        // SAFETY: a live buffer.
-        Some((unsafe { buffer.GetGPUVirtualAddress() } + at, data))
+        let (_, _, gpu, data) = self.scratch_at(len, 256)?;
+        Some((gpu, data))
     }
 
-    /// [`HostList::scratch`] and the buffer it lies in, for a descriptor
-    /// slot to hold: the slot outlives the list's use of it.
-    pub(crate) fn scratch_held(&self, len: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
-        let (buffer, at, data) = self.scratch_at(len, 256)?;
-        // SAFETY: a live buffer.
-        let gpu = unsafe { buffer.GetGPUVirtualAddress() } + at;
-        Some((buffer, gpu, data))
+    /// [`HostList::scratch`], the buffer it lies in, for a descriptor slot
+    /// to hold (the slot outlives the list's use of it), and the offset in
+    /// that buffer: the buffer, the host address, the offset and the CPU
+    /// pointer.
+    pub(crate) fn scratch_held(&self, len: u64) -> Option<(ID3D12Resource, u64, u64, *mut u8)> {
+        let (buffer, at, gpu, data) = self.scratch_at(len, 256)?;
+        Some((buffer, gpu, at, data))
     }
 
     /// [`HostList::scratch`]: the buffer, the offset in it (a multiple of
-    /// `align`, 256 or more and a power of two) and the CPU pointer.
-    fn scratch_at(&self, len: u64, align: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
+    /// `align`, 256 or more and a power of two), the host address of that
+    /// offset and the CPU pointer.
+    fn scratch_at(&self, len: u64, align: u64) -> Option<(ID3D12Resource, u64, u64, *mut u8)> {
         let host = host()?;
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).next_multiple_of(256);
@@ -7436,7 +7442,9 @@ impl HostList {
             let (buffer, data) = host.upload_buffer(len)?;
             name(&buffer, || format!("list scratch {len:#x}"));
             self.deferred().hold_upload(buffer.clone(), len);
-            return Some((buffer, 0, data));
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            return Some((buffer, 0, gpu, data));
         }
         // The chunk in use while `len` fits in what is left of it, else the
         // next one (a list's first chunk may be a small one).
@@ -7453,12 +7461,13 @@ impl HostList {
             s.chunks.push((chunk, size));
             s.used = 0;
         }
-        let (data, buffer) = (s.chunks[s.current].0.data, s.chunks[s.current].0.buffer.clone());
+        let chunk = &s.chunks[s.current].0;
+        let (data, gpu, buffer) = (chunk.data, chunk.gpu, chunk.buffer.clone());
         // (Every slice is a multiple of 256 bytes long: with 256 this is
         // where the last one ended.)
         let at = s.used.next_multiple_of(align);
         s.used = at + len;
-        Some((buffer, at, (data + at as usize) as *mut u8))
+        Some((buffer, at, gpu + at, (data + at as usize) as *mut u8))
     }
 
     /// The bytes of scratch chunks the list holds now (after a reset:
@@ -8078,22 +8087,25 @@ mod upload_slice_tests {
         let list = host.new_list().unwrap();
         // A constant's 256 bytes leave the next slice at 256: an upload goes
         // to 512.
-        let (a, at_a, _) = list.scratch_at(100, 256).unwrap();
-        let (b, at_b, data_b) = list.scratch_at(3000, PLACEMENT_ALIGN).unwrap();
+        let (a, at_a, _, _) = list.scratch_at(100, 256).unwrap();
+        let (b, at_b, gpu_b, data_b) = list.scratch_at(3000, PLACEMENT_ALIGN).unwrap();
+        // The chunk's host address, taken when it was made, is the buffer's.
+        // SAFETY: a live buffer.
+        assert_eq!(gpu_b, unsafe { b.GetGPUVirtualAddress() } + at_b);
         assert_eq!(at_a % 256, 0);
         assert_eq!(at_b % PLACEMENT_ALIGN, 0);
         if a.as_raw() == b.as_raw() {
             assert!(at_b >= at_a + 256);
         }
         // What follows starts past the upload's bytes (rounded to 256).
-        let (c, at_c, data_c) = list.scratch_at(64, 256).unwrap();
+        let (c, at_c, _, data_c) = list.scratch_at(64, 256).unwrap();
         if b.as_raw() == c.as_raw() {
             assert_eq!(at_c, at_b + 3072);
             assert_eq!(data_c as usize - data_b as usize, 3072);
         }
         // One that does not fit what is left of a chunk goes to the next, at
         // its start.
-        let (_, at_d, _) = list.scratch_at(SCRATCH_CHUNK, PLACEMENT_ALIGN).unwrap();
+        let (_, at_d, _, _) = list.scratch_at(SCRATCH_CHUNK, PLACEMENT_ALIGN).unwrap();
         assert_eq!(at_d, 0);
         list.close();
     }

@@ -841,7 +841,7 @@ impl Host {
                     && *index as usize / 4 % parts == part
                 {
                     // (A heap that is gone: nothing can read the slot.)
-                    crate::descriptor::constant_slot(*heap, *index, &own.between, gpu + op.at, op.len as u32);
+                    crate::descriptor::constant_slot(*heap, *index, &own.between, gpu + op.at, op.at, op.len as u32);
                 }
             }
         });

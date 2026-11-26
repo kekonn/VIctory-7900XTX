@@ -276,7 +276,7 @@ impl HostList {
                 }
                 STATS[2].fetch_add(1, Ordering::Relaxed);
             }
-            (None, Some((from, offset, _))) => unsafe {
+            (None, Some((from, offset, _, _))) => unsafe {
                 self.list.CopyBufferRegion(&to.buffer, at, from, *offset, len as u64);
             },
             (None, None) => return false,
@@ -291,7 +291,7 @@ impl HostList {
             src,
             len,
             shadow: to,
-            from: scratch.map(|s| s.2 as usize),
+            from: scratch.map(|s| s.3 as usize),
         }));
         deferred.title_written();
         self.changed_something();

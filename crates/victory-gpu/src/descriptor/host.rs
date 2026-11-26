@@ -3046,7 +3046,8 @@ impl HostHeap {
     }
 
     /// Makes slot `index` (a dynamic one) a constant buffer view of host
-    /// memory, `size` bytes at `gpu` of `buffer`, which the slot holds.
+    /// memory, `size` bytes at `gpu` of `buffer` (`offset` bytes into it),
+    /// which the slot holds.
     ///
     /// The list holds it too, until it is reset; the slot shows it until it
     /// is made again, and a shader that picks the slot by an index it
@@ -3054,7 +3055,7 @@ impl HostHeap {
     /// chunks go back to the pool and are freed past its limit: session n02
     /// lost the device to a page fault in the memory of three freed ones.
     /// `VICTORY_SLOT_HOLDS=0`: only the list holds it, as before.
-    pub(crate) fn constant_at(&self, index: u32, buffer: &ID3D12Resource, gpu: u64, size: u32) {
+    pub(crate) fn constant_at(&self, index: u32, buffer: &ID3D12Resource, gpu: u64, offset: u64, size: u32) {
         static HOLDS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let holds = *HOLDS.get_or_init(|| std::env::var_os("VICTORY_SLOT_HOLDS").is_none_or(|v| v != "0"));
         let Some(host) = host() else { return };
@@ -3067,12 +3068,10 @@ impl HostHeap {
             host.device
                 .CreateConstantBufferView(Some(&desc), self.at(index))
         };
-        self.put(index);
         // A program that reads it as raw bytes reads its twin.
         let twin = self.twin(index).filter(|_| desc.SizeInBytes > 0);
         if let Some(twin) = twin {
-            // SAFETY: a live buffer that holds the range.
-            let first = (gpu - unsafe { buffer.GetGPUVirtualAddress() }) / 4;
+            let first = offset / 4;
             let raw = D3D12_SHADER_RESOURCE_VIEW_DESC {
                 Format: DXGI_FORMAT_R32_TYPELESS,
                 ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
@@ -3086,10 +3085,14 @@ impl HostHeap {
                     },
                 },
             };
-            // SAFETY: as above, and a slot of our heaps.
+            // SAFETY: a live buffer that holds the range, and a slot of our
+            // heaps.
             unsafe { host.device.CreateShaderResourceView(buffer, Some(&raw), twin) };
+            self.put_pair(index);
+        } else {
+            self.put(index);
+            self.twin_made(index, false);
         }
-        self.twin_made(index, twin.is_some());
         // After the descriptor: what it showed is let go when nothing shows
         // it any more.
         self.keep(index, holds.then(|| buffer.clone()));
@@ -3162,6 +3165,42 @@ impl HostHeap {
         if self.twin(index).is_some() {
             self.copy_to(self.raw + index, 1);
         }
+    }
+
+    /// The descriptor and the raw twin this thread made last go to slot
+    /// `index` and its twin, as [`HostHeap::put`] then
+    /// [`HostHeap::twin_made`] would put them, in one copy: this thread's
+    /// two staged slots ([`staged`]) lie side by side, so one source range
+    /// of two goes to the two slots, each copied whole as before. A table's
+    /// constant buffers made some 23,000 such pairs a frame, two copies
+    /// each. Made in place (no staged slots), as before.
+    fn put_pair(&self, index: u32) {
+        let shown = self.twins.get(index as usize);
+        let (Some(from), Some(host), Some(shown)) = (staged(self.sampler, 0), host(), shown) else {
+            self.put(index);
+            return self.twin_made(index, true);
+        };
+        let (to, sizes) = ([self.cpu(index), self.cpu(self.raw + index)], [1u32, 1]);
+        #[cfg(feature = "diagnostics")]
+        for slot in [index, self.raw + index] {
+            if let Some(written) = self.written.get(slot as usize) {
+                written.store(crate::host::coarse_ms() as u32, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        // SAFETY: two slots of our heap, and this thread's two slots of a
+        // heap of the same type.
+        unsafe {
+            host.device.CopyDescriptors(
+                2,
+                to.as_ptr(),
+                Some(sizes.as_ptr()),
+                1,
+                &from,
+                Some(&2u32),
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            )
+        };
+        shown.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn copy_to(&self, to: u32, which: u32) {
@@ -5353,7 +5392,7 @@ mod tests {
             assert!(alive(), "a view of {size} bytes");
         }
         // SAFETY: a live upload buffer.
-        heap.constant_at(1, &buffer, unsafe { buffer.GetGPUVirtualAddress() }, 969_472);
+        heap.constant_at(1, &buffer, unsafe { buffer.GetGPUVirtualAddress() }, 0, 969_472);
         assert!(alive(), "a view of the list's own memory");
         assert_eq!(constant_bytes(480), 512);
         assert_eq!(constant_bytes(64 << 10), 64 << 10);
