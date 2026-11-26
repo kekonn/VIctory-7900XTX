@@ -6860,8 +6860,9 @@ impl HostList {
                 D3D12_RESOURCE_STATES(before as i32),
                 D3D12_RESOURCE_STATES(wanted as i32),
             );
-            // SAFETY: an open list and a live texture.
-            unsafe { self.list.ResourceBarrier(&[barrier]) };
+            // SAFETY: an open list and a live texture (the list's states
+            // hold it).
+            unsafe { self.list.barriers(&[barrier]) };
         }
     }
 

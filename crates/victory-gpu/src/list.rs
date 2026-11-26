@@ -1372,7 +1372,7 @@ extern "system" fn clear_rtv(
         unsafe {
             if let Some((_, before)) = list.transition(record.resource, RENDER_TARGET) {
                 use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
-                list.list.ResourceBarrier(&[crate::host::transition(
+                list.list.barriers(&[crate::host::transition(
                     texture,
                     State(before as i32),
                     State(RENDER_TARGET as i32),

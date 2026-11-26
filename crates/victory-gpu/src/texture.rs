@@ -282,8 +282,9 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
             D3D12_RESOURCE_STATES(before as i32),
             D3D12_RESOURCE_STATES(state as i32),
         );
-        // SAFETY: an open list and a live texture.
-        unsafe { list.list.ResourceBarrier(&[barrier]) };
+        // SAFETY: an open list and a live texture (the list's states hold
+        // it).
+        unsafe { list.list.barriers(&[barrier]) };
         before
     });
     if !first && before.is_none() {
@@ -318,7 +319,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     // the footprints and rests in the common state between copies.
     unsafe {
         list.list
-            .ResourceBarrier(&[crate::host::transition(&through.buffer, common, written)]);
+            .barriers(&[crate::host::transition(&through.buffer, common, written)]);
         for (index, (of_written, _)) in through.parts.iter().enumerate() {
             list.list
                 .CopyTextureRegion(&rows(of_written), 0, 0, 0, &part(from, index), None);
