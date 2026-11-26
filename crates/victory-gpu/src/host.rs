@@ -2099,6 +2099,102 @@ fn trim_spare_chunks() {
     drop(freed);
 }
 
+/// Whether the read-back buffers of the textures copied back into title
+/// memory ([`crate::texback`]) are kept for the next list: each is mapped
+/// once and stays mapped, and goes back when the list that copied into it
+/// is reset or dropped, when the card is done with it (not when its texels
+/// land: that can be skipped, or come again). Before, every list that
+/// wrote the ocean's textures made, mapped, unmapped and freed a buffer for
+/// each of them, some four a list, every frame.
+/// `VICTORY_READBACK_POOL=0`: a buffer made for each copy and mapped when
+/// it lands, as before. On by default; A/B-able with
+/// `VICTORY_AB=<s>,VICTORY_READBACK_POOL`.
+pub(crate) fn read_back_pool() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_READBACK_POOL") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_READBACK_POOL").is_none_or(|v| v != "0"))
+}
+
+/// The most bytes of read-back buffers kept while no list holds them.
+const READ_BACK_MOST: u64 = 8 << 20;
+
+/// A read-back buffer of `size` bytes, and its mapping: 0 if it was made
+/// without the pool ([`read_back_pool`]) and is mapped only when read.
+pub(crate) struct ReadBack {
+    pub(crate) buffer: ID3D12Resource,
+    pub(crate) data: usize,
+    size: u64,
+}
+
+// SAFETY: a D3D12 resource (free-threaded) and its persistent mapping,
+// read only once the list that wrote it has run.
+unsafe impl Send for ReadBack {}
+
+/// Read-back buffers no list holds, mapped.
+static READ_BACK_SPARE: Mutex<Spare<ReadBack>> = Mutex::new(Spare::new());
+
+/// Since the last frame-rate line: read-back buffers taken from those kept,
+/// and made.
+static READ_BACK_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+impl Host {
+    /// A read-back buffer of `size` bytes for a texture copied back: one
+    /// kept ([`READ_BACK_SPARE`]) or a new one, mapped with the pool.
+    pub(crate) fn take_read_back(&self, size: u64) -> Option<ReadBack> {
+        if !read_back_pool() {
+            return Some(ReadBack { buffer: self.read_back_buffer(size)?, data: 0, size });
+        }
+        if let Some(back) = READ_BACK_SPARE.lock().unwrap_or_else(|e| e.into_inner()).take(size) {
+            READ_BACK_STATS[0].fetch_add(1, Ordering::Relaxed);
+            return Some(back);
+        }
+        let buffer = self.read_back_buffer(size)?;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: our read-back buffer; the mapping lasts as long as it.
+        if unsafe { buffer.Map(0, None, Some(&mut data)) }.is_err() || data.is_null() {
+            return None;
+        }
+        name(&buffer, || "texture read-back".into());
+        READ_BACK_STATS[1].fetch_add(1, Ordering::Relaxed);
+        Some(ReadBack { buffer, data: data as usize, size })
+    }
+}
+
+/// The list that copied into `back` was reset or dropped, so the card is
+/// done with it: kept for the next list, or unmapped and freed past
+/// [`READ_BACK_MOST`] and without the pool.
+pub(crate) fn give_read_back(back: ReadBack) {
+    if back.data == 0 {
+        return;
+    }
+    let size = back.size;
+    let back = if read_back_pool() {
+        READ_BACK_SPARE.lock().unwrap_or_else(|e| e.into_inner()).give(back, size, READ_BACK_MOST)
+    } else {
+        Some(back)
+    };
+    // Freed outside the lock.
+    if let Some(back) = back {
+        // SAFETY: mapped when it was made.
+        unsafe { back.buffer.Unmap(0, None) };
+    }
+}
+
+/// For the frame-rate line, with [`read_back_pool`]: the read-back buffers
+/// of textures copied back that were taken from those kept, and made, per
+/// frame since the last one.
+fn read_back_line(frames: f64) {
+    let [kept, made] = [0, 1].map(|i| READ_BACK_STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    if kept + made > 0.0 {
+        tracing::info!(
+            "texture read-back buffers per frame (VICTORY_READBACK_POOL): {kept:.1} taken from those kept, {made:.1} made"
+        );
+    }
+}
+
 /// What the host keeps for copies in the card's own memory
 /// ([`crate::shadow::cards`]): three lists of ours and the compare.
 struct CardWork {
@@ -9235,6 +9331,7 @@ impl Meter {
             card_clock_line(frames, ms);
             upq::line(frames);
             rec::line(frames);
+            read_back_line(frames);
             #[cfg(feature = "diagnostics")]
             spans::line(frames);
             crate::shadow::back_line(frames);

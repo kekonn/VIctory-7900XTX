@@ -126,7 +126,9 @@ impl Target {
 
 /// The readback resources and the allocation the pixels belong to.
 pub(crate) struct Back {
-    buffer: ID3D12Resource,
+    /// The read-back buffer; given back when the list holding this is
+    /// reset or dropped ([`crate::host::give_read_back`]).
+    read: Option<crate::host::ReadBack>,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     mips: u32,
@@ -137,6 +139,16 @@ pub(crate) struct Back {
 impl Back {
     pub(crate) fn range(&self) -> (usize, usize) {
         (self.ticket.at, self.ticket.end)
+    }
+}
+
+impl Drop for Back {
+    /// A list's copies are dropped when it is reset, after its submissions
+    /// ran, or when it is dropped: the card is done with the buffer.
+    fn drop(&mut self) {
+        if let Some(read) = self.read.take() {
+            crate::host::give_read_back(read);
+        }
     }
 }
 
@@ -177,11 +189,12 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
             .checked_mul(u64::from(format.Depth))?;
         total = total.max(footprint.Offset.checked_add(pitched)?);
     }
-    let buffer = host.read_back_buffer(total)?;
+    let read = host.take_read_back(total)?;
+    let buffer = &read.buffer;
     for (i, footprint) in footprints.iter().enumerate() {
         let to = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: a borrowed pointer the location never releases.
-            pResource: unsafe { std::mem::transmute_copy(&buffer) },
+            pResource: unsafe { std::mem::transmute_copy(buffer) },
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *footprint },
         };
@@ -194,7 +207,7 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
         // SAFETY: an open list; the texture is in the copy-source state.
         unsafe { list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
-    Some(Back { buffer, footprints, rows, mips, layout: target.layout, ticket: target.ticket })
+    Some(Back { read: Some(read), footprints, rows, mips, layout: target.layout, ticket: target.ticket })
 }
 
 /// Once the list has run, tile its texels back into the same title allocation.
@@ -217,10 +230,14 @@ pub(crate) fn land(back: &Back) {
     if !crate::host::read_into(at as *const u8, &mut tiled) {
         return;
     }
-    let mut data = std::ptr::null_mut();
+    let Some(read) = &back.read else { return };
+    // Kept mapped with the pool (`VICTORY_READBACK_POOL`); mapped here
+    // without it.
+    let map_here = read.data == 0;
+    let mut data = read.data as *mut std::ffi::c_void;
     // SAFETY: our read-back buffer, written by the list that has run.
     unsafe {
-        if back.buffer.Map(0, None, Some(&mut data)).is_err() || data.is_null() {
+        if map_here && (read.buffer.Map(0, None, Some(&mut data)).is_err() || data.is_null()) {
             return;
         }
     }
@@ -234,13 +251,17 @@ pub(crate) fn land(back: &Back) {
         if let Err(e) = back.layout.tile(&mut tiled, mip, slice, linear, pitch, pitch * rows as usize) {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(?e, mip, slice, "a texture copied back could not be tiled"));
-            // SAFETY: mapped above.
-            unsafe { back.buffer.Unmap(0, None) };
+            if map_here {
+                // SAFETY: mapped above.
+                unsafe { read.buffer.Unmap(0, None) };
+            }
             return;
         }
     }
-    // SAFETY: mapped above.
-    unsafe { back.buffer.Unmap(0, None) };
+    if map_here {
+        // SAFETY: mapped above.
+        unsafe { read.buffer.Unmap(0, None) };
+    }
     crate::host::copy_mapped(at as *mut u8, tiled.as_ptr(), size, true);
     let copied = COPIED.fetch_add(1, Ordering::Relaxed) + 1;
     if copied == 1 || copied.is_multiple_of(128) {
