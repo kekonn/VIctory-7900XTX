@@ -2,6 +2,7 @@
 #   scripts\play.ps1 -Exe <path of your own copy's executable>
 # -Safe         without the newer, faster ways (the first thing to try when something is wrong)
 # -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
+# -Fast         the README's fastest setup: Series S profile, renderer patches 1, 2, 5, 6, 7 (VICTORY_PORT_*)
 # -Build        target\diag (the default, the build all measurements are of) or target\release
 # -More         other settings: -More @{VICTORY_PANEL='1'}
 # -Log          also write everything the runtime logs (its frame-rate and A/B lines) to that file: -Log ab-1.log
@@ -10,6 +11,7 @@ param(
     [Parameter(Mandatory)][string]$Exe,
     [switch]$Safe,
     [switch]$RayTracing,
+    [switch]$Fast,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [hashtable]$More = @{},
     [string]$Log
@@ -26,6 +28,9 @@ if ($Safe) {
     $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
 }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
+if ($Fast) {
+    foreach ($k in 'CONSTANTS', 'DESCRIPTORS', 'CBV', 'GUARD', 'JOURNAL') { $settings["VICTORY_PORT_$k"] = '1' }
+}
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
 $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"
@@ -45,12 +50,14 @@ if ($discarded) {
 $Exe = (Resolve-Path $Exe).Path
 # (Relative to where it was started from, not the folder the run goes to.)
 if ($Log) { $Log = [IO.Path]::GetFullPath([IO.Path]::Combine((Get-Location).Path, $Log)); $env:NO_COLOR = '1' }
+$runArgs = @('run', $Exe, '--execute')
+if ($Fast) { $runArgs += '--console', 'series-s' }
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
 try {
     if ($Log) {
         # The runtime logs to stderr: taken in here with what it prints, as plain lines.
-        & $victory run $Exe --execute 2>&1 | ForEach-Object { "$_" } | Tee-Object -FilePath $Log
+        & $victory @runArgs 2>&1 | ForEach-Object { "$_" } | Tee-Object -FilePath $Log
     } else {
-        & $victory run $Exe --execute
+        & $victory @runArgs
     }
 } finally { Pop-Location }
