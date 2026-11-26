@@ -275,8 +275,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     // The source's first use in the list records nothing (its prelude
     // brings it to the state); a use in another way since the last copy
     // shows as a change of state.
-    let before = list.transition(source, COPY_SOURCE).map(|(texture, before)| {
-        let state = crate::host::legal_state(texture, COPY_SOURCE);
+    let before = list.transition(source, COPY_SOURCE).map(|(texture, before, state)| {
         let barrier = crate::host::transition(
             texture,
             D3D12_RESOURCE_STATES(before as i32),
@@ -639,14 +638,6 @@ pub(crate) fn forget(resource: usize) {
     if let Some(through) = through.as_mut() {
         through.remove(&resource);
     }
-}
-
-/// Whether `resource`'s host copy takes its contents from title memory:
-/// a texture the host GPU does not render to or write.
-pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
-    const TARGET_DEPTH_UNORDERED: i32 = 0x7;
-    // SAFETY: a live resource.
-    unsafe { texture.GetDesc() }.Flags.0 & TARGET_DEPTH_UNORDERED == 0
 }
 
 /// Records, once per list, the copy of `resource`'s staging buffer into

@@ -6824,14 +6824,15 @@ impl HostList {
     }
 
     /// Moves a title texture's host copy to `wanted` (a host state) in this
-    /// list: the host texture and the state it leaves, if that is a change.
-    /// The list's first use of a texture records nothing: its prelude brings
-    /// the texture there at submission.
+    /// list: the host texture, the state it leaves and the state it goes to
+    /// (`wanted` without what the texture's flags forbid, [`legal_for`]), if
+    /// that is a change. The list's first use of a texture records nothing:
+    /// its prelude brings the texture there at submission.
     pub(crate) fn transition(
         &self,
         resource: crate::object::This,
         wanted: u32,
-    ) -> Option<(&'static ID3D12Resource, u32)> {
+    ) -> Option<(&'static ID3D12Resource, u32, u32)> {
         let copy = crate::resource::host_copy(resource)?;
         // SAFETY: as in `crate::resource::host_resource`; the list's states
         // hold the copy from here on.
@@ -6849,7 +6850,7 @@ impl HostList {
                 if before != wanted {
                     self.changed_something();
                 }
-                (before != wanted).then_some((texture, before))
+                (before != wanted).then_some((texture, before, wanted))
             }
         }
     }

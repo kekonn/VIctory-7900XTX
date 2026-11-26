@@ -2584,8 +2584,9 @@ impl State {
                     continue;
                 }
             };
-            let texture = crate::resource::host_resource(resource);
-            let title_fills = texture.is_some_and(crate::texture::title_written);
+            let held = crate::resource::host_held(resource);
+            let texture = held.map(|h| &h.texture);
+            let title_fills = held.is_some_and(crate::resource::HostTexture::title_written);
             if !title_fills {
                 at_once();
                 // a render target, a depth or unordered access texture: the host's own
