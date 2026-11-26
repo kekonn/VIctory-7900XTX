@@ -2596,6 +2596,9 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// The buffers between copies taken from the pool for this recording
+    /// ([`place::Between`]), given back when the list is reset or dropped.
+    betweens: Vec<place::Between>,
     /// The pipelines [`HostList::bind_pipeline`] kept, by address.
     bound: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// Buffer ranges refreshed since the last title copy (host copy,
@@ -4022,6 +4025,7 @@ fn late_line(frames: f64) {
             t[3],
         );
     }
+    place::between_line(frames);
     card_steps::log(frames);
     crate::port::log(frames);
     crate::port_cbv::log(frames);
@@ -7212,6 +7216,7 @@ impl HostList {
             if !(deferred.copies.is_empty()
                 && deferred.uploads.is_empty()
                 && deferred.kept.is_empty()
+                && deferred.betweens.is_empty()
                 && deferred.textures.is_empty()
                 && deferred.writes.is_empty()
                 && deferred.backs.is_empty()

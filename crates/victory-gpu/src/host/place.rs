@@ -320,17 +320,114 @@ impl HostList {
         Some(between)
     }
 
-    /// A buffer on the card for this recording alone.
+    /// A buffer on the card for this recording alone: with [`between_pool`]
+    /// one kept ([`BETWEEN`]) or a new one, which the list holds until it is
+    /// reset or dropped.
     fn between(&self, host: &Host, len: u64) -> Option<ID3D12Resource> {
-        let buffer = host.uav_buffer(len.next_multiple_of(1 << 16))?;
-        name(&buffer, || "bytes between copies".into());
-        self.keep(&buffer);
+        if !between_pool() {
+            let buffer = host.uav_buffer(len.next_multiple_of(1 << 16))?;
+            name(&buffer, || "bytes between copies".into());
+            self.keep(&buffer);
+            return Some(buffer);
+        }
+        let size = between_size(len);
+        let kept = BETWEEN.lock().unwrap_or_else(|e| e.into_inner()).take(size);
+        let buffer = match kept {
+            Some(buffer) => {
+                BETWEEN_STATS[0].fetch_add(1, Ordering::Relaxed);
+                buffer
+            }
+            None => {
+                let buffer = host.uav_buffer(size)?;
+                name(&buffer, || "bytes between copies".into());
+                BETWEEN_STATS[1].fetch_add(1, Ordering::Relaxed);
+                buffer
+            }
+        };
+        self.deferred().betweens.push(Between { buffer: buffer.clone(), size });
         Some(buffer)
+    }
+}
+
+/// Whether the buffers that hold the bytes between the two halves of a copy
+/// out of what shaders wrote ([`HostList::between`]: a copy within one host
+/// copy, or into a texture) are kept for the next list. A list holds the
+/// ones it took until it is reset, after its submissions ran, or dropped,
+/// where its scratch chunks go back, so none is used twice in one
+/// recording. They come in sizes of powers of two from 64 KiB, and at most
+/// [`BETWEEN_MOST`] bytes of them are kept. Before, each such copy made a
+/// committed buffer on the card, made it resident and freed it with the
+/// list. `VICTORY_BETWEEN_POOL=1`: on. Off by default; A/B-able with
+/// `VICTORY_AB=<s>,VICTORY_BETWEEN_POOL`.
+fn between_pool() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_BETWEEN_POOL") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BETWEEN_POOL").is_some_and(|v| v == "1"))
+}
+
+/// The size of the pool's buffer between copies for `len` bytes
+/// ([`between_pool`]): the power of two at or above it, at least 64 KiB, so
+/// that copies of sizes near one another share buffers.
+fn between_size(len: u64) -> u64 {
+    len.max(1 << 16).next_power_of_two()
+}
+
+/// The most bytes of buffers between copies kept while no list holds them.
+const BETWEEN_MOST: u64 = 64 << 20;
+
+/// Buffers between copies no list holds ([`between_pool`]).
+static BETWEEN: Mutex<Spare<ID3D12Resource>> = Mutex::new(Spare::new());
+
+/// Since the last frame-rate line, with [`between_pool`]: buffers between
+/// copies taken from those kept, and made.
+static BETWEEN_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// A buffer between copies of the pool's ([`between_pool`]) that a list
+/// holds, and its bytes.
+pub(super) struct Between {
+    buffer: ID3D12Resource,
+    size: u64,
+}
+
+impl Drop for Between {
+    /// A list's buffers are dropped when it is reset, after its submissions
+    /// ran, or when it is dropped: the card is done with the buffer. It is
+    /// kept for the next list, or freed past [`BETWEEN_MOST`] and without
+    /// the pool. A buffer left in a copy's source state needs no barrier
+    /// back: a buffer is common again when its submission ends.
+    fn drop(&mut self) {
+        if !between_pool() {
+            return;
+        }
+        let back = BETWEEN.lock().unwrap_or_else(|e| e.into_inner()).give(self.buffer.clone(), self.size, BETWEEN_MOST);
+        // Freed outside the lock.
+        drop(back);
+    }
+}
+
+/// For the frame-rate line, with [`between_pool`]: the buffers between
+/// copies taken from those kept, and made, per frame since the last one.
+pub(super) fn between_line(frames: f64) {
+    let [kept, made] = [0, 1].map(|i| BETWEEN_STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    if kept + made > 0.0 {
+        tracing::info!("buffers between copies per frame (VICTORY_BETWEEN_POOL): {kept:.1} taken from those kept, {made:.1} made");
     }
 }
 
 #[cfg(test)]
 mod tests {
+    /// The pool's sizes of buffers between copies.
+    #[test]
+    fn between_sizes() {
+        assert_eq!(super::between_size(1), 64 << 10);
+        assert_eq!(super::between_size(64 << 10), 64 << 10);
+        assert_eq!(super::between_size((64 << 10) + 1), 128 << 10);
+        assert_eq!(super::between_size(3 << 20), 4 << 20);
+    }
+
     /// What copies with two sides cost to make (ignored: a measurement for
     /// `VICTORY_CARD_ALL`): buffers of 64 KiB on the card and in the PC's
     /// memory.
