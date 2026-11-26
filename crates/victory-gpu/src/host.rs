@@ -43,10 +43,17 @@ pub(crate) struct Host {
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
     event: HANDLE,
+    /// A ring of render target views. Only held, so that `rtv_start` stays
+    /// good: [`Host::rtv`] works from the start taken once when the heap was
+    /// made, with no call into the driver for it. The same for `dsvs`.
+    #[allow(dead_code)]
     rtvs: ID3D12DescriptorHeap,
+    rtv_start: usize,
     rtv_size: u32,
     /// A ring of depth views, used as `rtvs`.
+    #[allow(dead_code)]
     dsvs: ID3D12DescriptorHeap,
+    dsv_start: usize,
     dsv_size: u32,
     next_dsv: AtomicU32,
     /// With `VICTORY_D3D12_DEBUG` set (diagnostics builds): the debug
@@ -1069,6 +1076,7 @@ fn create() -> windows::core::Result<Host> {
                 NumDescriptors: RTV_RING,
                 ..Default::default()
             })?;
+        let rtv_start = rtvs.GetCPUDescriptorHandleForHeapStart().ptr;
         let rtv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
         let dsvs: ID3D12DescriptorHeap =
             device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
@@ -1076,6 +1084,7 @@ fn create() -> windows::core::Result<Host> {
                 NumDescriptors: RTV_RING,
                 ..Default::default()
             })?;
+        let dsv_start = dsvs.GetCPUDescriptorHandleForHeapStart().ptr;
         let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
         let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
@@ -1098,8 +1107,10 @@ fn create() -> windows::core::Result<Host> {
             submitted: Mutex::new(0),
             event,
             rtvs,
+            rtv_start,
             rtv_size,
             dsvs,
+            dsv_start,
             dsv_size,
             next_dsv: AtomicU32::new(0),
             messages,
@@ -6600,8 +6611,9 @@ impl Host {
         // SAFETY: a slot of our heap and a live resource, or none with a
         // description (a typed null view).
         unsafe {
-            let mut handle = self.rtvs.GetCPUDescriptorHandleForHeapStart();
-            handle.ptr += (slot * self.rtv_size) as usize;
+            let handle = D3D12_CPU_DESCRIPTOR_HANDLE {
+                ptr: self.rtv_start + (slot * self.rtv_size) as usize,
+            };
             self.device
                 .CreateRenderTargetView(resource, desc.map(|d| d as *const _), handle);
             handle
@@ -6617,8 +6629,9 @@ impl Host {
         let slot = self.next_dsv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
         // SAFETY: a slot of our heap and a live resource.
         unsafe {
-            let mut handle = self.dsvs.GetCPUDescriptorHandleForHeapStart();
-            handle.ptr += (slot * self.dsv_size) as usize;
+            let handle = D3D12_CPU_DESCRIPTOR_HANDLE {
+                ptr: self.dsv_start + (slot * self.dsv_size) as usize,
+            };
             self.device
                 .CreateDepthStencilView(resource, desc.map(|d| d as *const _), handle);
             handle
