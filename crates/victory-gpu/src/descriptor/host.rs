@@ -125,6 +125,7 @@ impl Made {
 }
 
 pub(crate) struct HostHeap {
+    id: u64,
     pub(crate) buffer_sweep: Mutex<crate::draw::BufferSweep>,
     pub(crate) buffer_frame: std::sync::atomic::AtomicU64,
     pub(crate) heap: ID3D12DescriptorHeap,
@@ -317,9 +318,7 @@ static RESHOWN_AFTER: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 struct Flip {
     /// The submission to wait for.
     after: u64,
-    /// The heap (its address), the slot, where its record is and which
-    /// record it was.
-    heap: usize,
+    /// The slot, where its record is and which record it was.
     index: u32,
     handle: u64,
     key: u64,
@@ -362,7 +361,7 @@ pub(crate) fn show_new_later() -> bool {
 }
 
 /// Slots [`show_new_later`] holds back now: heap, slot, record.
-static NEW_PENDING: std::sync::LazyLock<Mutex<std::collections::HashSet<(usize, u32, u64)>>> =
+static NEW_PENDING: std::sync::LazyLock<Mutex<std::collections::HashSet<(u64, u32, u64)>>> =
     std::sync::LazyLock::new(Default::default);
 
 /// Slots held back by [`show_new_later`] since the start.
@@ -517,7 +516,23 @@ fn neutral_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Res
     Some(texture.clone())
 }
 
-static FLIPS: Mutex<Vec<Flip>> = Mutex::new(Vec::new());
+// A queue exists for exactly the lifetime of its heap. Upload and submission
+// callbacks may arrive after drop, so they can only append to an existing queue.
+static FLIPS: Mutex<std::collections::BTreeMap<u64, Vec<Flip>>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+fn queue_flip(heap: u64, flip: Flip) {
+    if let Some(queue) = FLIPS.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&heap) {
+        queue.push(flip);
+    }
+}
+
+impl Drop for HostHeap {
+    fn drop(&mut self) {
+        FLIPS.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.id);
+        NEW_PENDING.lock().unwrap_or_else(|e| e.into_inner()).retain(|&(heap, _, _)| heap != self.id);
+    }
+}
 
 /// Makes the slots whose new texture's upload has run
 /// ([`HostHeap::texture_slots_flip`]); on any thread. Not if the heap is at
@@ -1729,7 +1744,14 @@ impl HostHeap {
             })
             .flatten();
         let queued = std::sync::Arc::new(Queued::new(if sampler { 0 } else { count }));
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        use std::sync::atomic::Ordering::Relaxed;
+        let id = NEXT_ID
+            .fetch_update(Relaxed, Relaxed, |id| id.checked_add(1))
+            .expect("host heap IDs exhausted");
+        FLIPS.lock().unwrap_or_else(|e| e.into_inner()).insert(id, Vec::new());
         let h = HostHeap {
+            id,
             buffer_sweep: Mutex::default(),
             buffer_frame: std::sync::atomic::AtomicU64::new(u64::MAX),
             heap,
@@ -2385,12 +2407,12 @@ impl HostHeap {
         if !self.show_later(index, handle) {
             return;
         }
-        let (heap, key) = (std::ptr::from_ref(self) as usize, record_key(handle));
+        let (heap, key) = (self.id, record_key(handle));
         let late = Some(crate::frame::current());
         let asked = crate::host::now_ms();
         job.then(move || {
-            let flip = Flip { after: 0, heap, index, handle, key, late, asked };
-            FLIPS.lock().unwrap_or_else(|e| e.into_inner()).push(flip);
+            let flip = Flip { after: 0, index, handle, key, late, asked };
+            queue_flip(heap, flip);
         });
     }
 
@@ -2413,12 +2435,12 @@ impl HostHeap {
     }
 
     fn flip(&self, list: &crate::host::HostList, index: u32, handle: u64, late: Option<u64>) {
-        let (heap, key) = (std::ptr::from_ref(self) as usize, record_key(handle));
+        let (heap, key) = (self.id, record_key(handle));
         let asked = crate::host::now_ms();
         list.defer_host(move || {
             let after = crate::host::submissions().0;
-            let flip = Flip { after, heap, index, handle, key, late, asked };
-            FLIPS.lock().unwrap_or_else(|e| e.into_inner()).push(flip);
+            let flip = Flip { after, index, handle, key, late, asked };
+            queue_flip(heap, flip);
         });
     }
 
@@ -2429,20 +2451,17 @@ impl HostHeap {
         let finished = crate::host::submissions().1;
         let ready: Vec<Flip> = {
             let mut flips = FLIPS.lock().unwrap_or_else(|e| e.into_inner());
-            if flips.is_empty() {
+            let Some(queue) = flips.get_mut(&self.id) else { return 0 };
+            if queue.is_empty() {
                 return 0;
             }
-            let own = std::ptr::from_ref(self) as usize;
-            let (ready, wait): (Vec<Flip>, Vec<Flip>) =
-                flips.drain(..).partition(|f| f.after <= finished && f.heap == own);
-            *flips = wait;
-            ready
+            queue.extract_if(.., |f| f.after <= finished).collect()
         };
         {
             let mut pending = NEW_PENDING.lock().unwrap_or_else(|e| e.into_inner());
             if !pending.is_empty() {
                 for f in &ready {
-                    pending.remove(&(f.heap, f.index, f.key));
+                    pending.remove(&(self.id, f.index, f.key));
                 }
             }
         }
@@ -3361,7 +3380,7 @@ impl HostHeap {
             {
                 // Asked again (each draw that reads the slot, each pass)
                 // while it waits: nothing more to do.
-                let own = (std::ptr::from_ref(self) as usize, index, key);
+                let own = (self.id, index, key);
                 if !NEW_PENDING.lock().unwrap_or_else(|e| e.into_inner()).insert(own) {
                     drop(held);
                     self.unmake_stale(index, stale);
@@ -3383,8 +3402,8 @@ impl HostHeap {
                     self.keep(index, kept);
                 }
                 let late = Some(crate::frame::current());
-                let flip = Flip { after, heap: std::ptr::from_ref(self) as usize, index, handle, key, late, asked: crate::host::now_ms() };
-                FLIPS.lock().unwrap_or_else(|e| e.into_inner()).push(flip);
+                let flip = Flip { after, index, handle, key, late, asked: crate::host::now_ms() };
+                queue_flip(self.id, flip);
                 NEW_LATER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 drop(held);
                 self.unmake_stale(index, stale);
@@ -5084,6 +5103,66 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn heap_id_changes_when_the_same_address_is_reused() {
+        if host().is_none() {
+            eprintln!("skipping heap lifetime test: D3D12 device unavailable");
+            return;
+        }
+        let mut heap = Box::new(HostHeap::new(true, 1).unwrap());
+        let address = std::ptr::from_ref(&*heap);
+        let first = heap.id;
+        *heap = HostHeap::new(true, 1).unwrap();
+        assert_eq!(std::ptr::from_ref(&*heap), address);
+        assert!(heap.id > first);
+        assert_eq!(heap.texture_slots_flip(), 0);
+    }
+
+    #[test]
+    fn dropping_a_heap_removes_only_its_pending_work() {
+        if host().is_none() {
+            eprintln!("skipping heap lifetime test: D3D12 device unavailable");
+            return;
+        }
+        let first = HostHeap::new(true, 1).unwrap();
+        let other = HostHeap::new(true, 1).unwrap();
+        let retired = first.id;
+        let record = [0u32; 3];
+        let handle = record.as_ptr() as u64;
+        let flip = || Flip { after: 0, index: 0, handle, key: 7, late: None, asked: 0 };
+        for id in [retired, other.id] {
+            queue_flip(id, flip());
+            assert!(NEW_PENDING.lock().unwrap().insert((id, 0, 7)));
+        }
+
+        drop(first);
+        // A deferred callback may still try to enqueue after its heap was dropped.
+        queue_flip(retired, flip());
+        {
+            let flips = FLIPS.lock().unwrap();
+            assert!(!flips.contains_key(&retired));
+            assert_eq!(flips[&other.id].len(), 1);
+        }
+        {
+            let pending = NEW_PENDING.lock().unwrap();
+            assert!(!pending.contains(&(retired, 0, 7)));
+            assert!(pending.contains(&(other.id, 0, 7)));
+        }
+
+        // Only the due flip drains. Its record has changed, so nothing is shown.
+        queue_flip(other.id, Flip { after: u64::MAX, key: 8, ..flip() });
+        assert!(NEW_PENDING.lock().unwrap().insert((other.id, 0, 8)));
+        assert_eq!(other.texture_slots_flip(), 0);
+        {
+            let flips = FLIPS.lock().unwrap();
+            assert_eq!(flips[&other.id].len(), 1);
+            assert_eq!(flips[&other.id][0].key, 8);
+        }
+        let pending = NEW_PENDING.lock().unwrap();
+        assert!(!pending.contains(&(other.id, 0, 7)));
+        assert!(pending.contains(&(other.id, 0, 8)));
+    }
 
     /// Every host sampler heap backs all 2,048 hardware descriptors and
     /// reserves slot 2,047 as a null sentinel so `umin(index, 2047)` in
