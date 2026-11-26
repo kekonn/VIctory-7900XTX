@@ -9529,6 +9529,7 @@ impl Meter {
             rec::line(frames);
             read_back_line(frames);
             slice_line(frames);
+            crate::draw::ia_line(frames);
             #[cfg(feature = "diagnostics")]
             spans::line(frames);
             crate::shadow::back_line(frames);
