@@ -3612,6 +3612,11 @@ impl State {
                 self.recording = NEXT.fetch_add(1, Ordering::Relaxed);
             }
             let recording = self.recording;
+            // Its copies of views made before in the list go together, at
+            // the end of the table (VICTORY_TABLE_GATHER).
+            if list_views {
+                crate::descriptor::host::gather_begin();
+            }
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -3712,6 +3717,9 @@ impl State {
                         }
                     }
                 }
+            }
+            if list_views {
+                crate::descriptor::host::gather_end();
             }
             made.push((slot, first * 32));
         }

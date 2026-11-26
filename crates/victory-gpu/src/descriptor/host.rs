@@ -2824,6 +2824,9 @@ impl HostHeap {
             }
             let views = views.as_mut()?;
             if views.recording != recording {
+                // Gathered copies read slots that are about to be made
+                // again for another recording: they go first.
+                gather_put();
                 views.recording = recording;
                 views.made.clear();
             }
@@ -2859,11 +2862,16 @@ impl HostHeap {
     }
 
     /// As [`HostHeap::copy_to`], from the slot `from`, which the card does not
-    /// see.
+    /// see: a [`ListViews`] slot, which holds its descriptor for the whole
+    /// recording, so the copy may wait for the end of the table while a
+    /// table's copies are gathered ([`gather_begin`]).
     fn copy_from(&self, to: u32, from: D3D12_CPU_DESCRIPTOR_HANDLE) {
         #[cfg(feature = "diagnostics")]
         if let Some(written) = self.written.get(to as usize) {
             written.store(crate::host::coarse_ms() as u32, std::sync::atomic::Ordering::Relaxed);
+        }
+        if gathered(self.cpu(to), from, self.step as usize) {
+            return;
         }
         let Some(host) = host() else { return };
         // SAFETY: a slot of our heap, and one of this thread's heap.
@@ -5126,6 +5134,20 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 mod tests {
     use super::*;
 
+    /// A gathered table's destinations: neighbours make one range, a gap
+    /// (the raw twins lie far off) starts another.
+    #[test]
+    fn gathered_destinations_join_neighbours() {
+        let (mut starts, mut sizes) = (Vec::new(), Vec::new());
+        let to = [100, 132, 164, 228, 9000, 9032];
+        dest_ranges(to.into_iter(), 32, &mut starts, &mut sizes);
+        assert_eq!(starts.iter().map(|s| s.ptr).collect::<Vec<_>>(), [100, 228, 9000]);
+        assert_eq!(sizes, [3, 1, 2]);
+        assert_eq!(sizes.iter().sum::<u32>() as usize, to.len());
+        dest_ranges(std::iter::empty(), 32, &mut starts, &mut sizes);
+        assert!(starts.is_empty() && sizes.is_empty());
+    }
+
     /// Every host sampler heap backs all 2,048 hardware descriptors and
     /// reserves slot 2,047 as a null sentinel so `umin(index, 2047)` in
     /// `victory-shader` never reads past smaller title sampler heaps.
@@ -6175,6 +6197,149 @@ pub(crate) fn note_listed(recording: u64, words: [u32; 3], listed: Listed) {
             made.listed = listed;
         }
     });
+}
+
+/// Whether the descriptors a fresh table copies from [`ListViews`] (and
+/// their raw twins) are gathered while the table is made and put with one
+/// `CopyDescriptors` for the table, instead of one `CopyDescriptorsSimple`
+/// each (`crate::draw::State::tables`, [`gather_begin`], [`gather_end`]).
+/// Only those copies wait: their sources hold their descriptors for the
+/// whole recording. Views made for the slot itself (constant buffers, nulls,
+/// views not listed, cleared twins) are built in the thread's one staged
+/// slot and still go at once; each of a table's slots and twins is written
+/// once for the table either way, so nothing written at once is written
+/// again by a gathered copy. Counted on the frame-rate line
+/// ([`gather_line`]). `VICTORY_TABLE_GATHER=1`: on. Off by default;
+/// A/B-able with `VICTORY_AB=<s>,VICTORY_TABLE_GATHER`.
+fn table_gather() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_TABLE_GATHER") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLE_GATHER").is_some_and(|v| v == "1"))
+}
+
+/// Since the last frame-rate line: descriptor copies gathered, and the
+/// `CopyDescriptors` calls made of them ([`table_gather`]).
+static GATHERED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// For the frame-rate line, with [`table_gather`]: copies gathered per frame
+/// since the last one, and the copy calls that saved.
+pub(crate) fn gather_line(frames: f64) {
+    let [copies, calls] = [0, 1].map(|i| GATHERED[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+    if copies > 0.0 {
+        tracing::info!(
+            "table descriptor copies per frame (VICTORY_TABLE_GATHER): {copies:.0} gathered into {calls:.0} calls, {:.0} calls saved",
+            copies - calls
+        );
+    }
+}
+
+/// This thread's gathered copies of the table it is making ([`table_gather`]).
+#[derive(Default)]
+struct Gather {
+    on: bool,
+    /// Size of a descriptor in the heaps copied to.
+    step: usize,
+    /// Destination and source handles.
+    pairs: Vec<(usize, usize)>,
+    /// The call's ranges, kept for their room.
+    starts: Vec<D3D12_CPU_DESCRIPTOR_HANDLE>,
+    sizes: Vec<u32>,
+    from: Vec<D3D12_CPU_DESCRIPTOR_HANDLE>,
+}
+
+thread_local! {
+    static GATHER: std::cell::RefCell<Gather> = std::cell::RefCell::new(Gather::default());
+}
+
+/// A fresh table is made now: its copies from [`ListViews`] wait for
+/// [`gather_end`], if [`table_gather`]. (A table made inside another on
+/// this thread ends the gathering for both; the rest of the outer one
+/// copies at once.)
+pub(crate) fn gather_begin() {
+    if table_gather() {
+        GATHER.with(|g| g.borrow_mut().on = true);
+    }
+}
+
+/// The table is made: its gathered copies go, in one call.
+pub(crate) fn gather_end() {
+    gather_put();
+    GATHER.with(|g| g.borrow_mut().on = false);
+}
+
+/// Keeps the copy of `from` to `to` for [`gather_put`], if this thread
+/// gathers now; false: copy it at once.
+fn gathered(to: D3D12_CPU_DESCRIPTOR_HANDLE, from: D3D12_CPU_DESCRIPTOR_HANDLE, step: usize) -> bool {
+    GATHER.with(|g| {
+        let mut g = g.borrow_mut();
+        if !g.on {
+            return false;
+        }
+        g.step = step;
+        g.pairs.push((to.ptr, from.ptr));
+        true
+    })
+}
+
+/// The copies gathered so far go, in one `CopyDescriptors`: destinations
+/// side by side make one range, each source is a range of one.
+fn gather_put() {
+    GATHER.with(|g| {
+        let g = &mut *g.borrow_mut();
+        if g.pairs.is_empty() {
+            return;
+        }
+        // Each destination is written once (one slot or twin of the table
+        // each), so their order is free.
+        g.pairs.sort_unstable_by_key(|&(to, _)| to);
+        debug_assert!(g.pairs.windows(2).all(|w| w[0].0 != w[1].0));
+        dest_ranges(g.pairs.iter().map(|&(to, _)| to), g.step, &mut g.starts, &mut g.sizes);
+        g.from.clear();
+        g.from.extend(g.pairs.iter().map(|&(_, from)| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: from }));
+        if let Some(host) = host() {
+            // SAFETY: slots of our heaps, and of this thread's heap of the
+            // same type; as many descriptors in the ranges as sources.
+            unsafe {
+                host.device.CopyDescriptors(
+                    g.starts.len() as u32,
+                    g.starts.as_ptr(),
+                    Some(g.sizes.as_ptr()),
+                    g.from.len() as u32,
+                    g.from.as_ptr(),
+                    None,
+                    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                )
+            };
+            GATHERED[0].fetch_add(g.pairs.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            GATHERED[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        g.pairs.clear();
+    });
+}
+
+/// Ranges of the sorted destinations `to`, `step` bytes apart: one for each
+/// run of neighbours.
+fn dest_ranges(
+    to: impl Iterator<Item = usize>,
+    step: usize,
+    starts: &mut Vec<D3D12_CPU_DESCRIPTOR_HANDLE>,
+    sizes: &mut Vec<u32>,
+) {
+    starts.clear();
+    sizes.clear();
+    for ptr in to {
+        if let (Some(start), Some(size)) = (starts.last(), sizes.last_mut())
+            && start.ptr + *size as usize * step == ptr
+        {
+            *size += 1;
+            continue;
+        }
+        starts.push(D3D12_CPU_DESCRIPTOR_HANDLE { ptr });
+        sizes.push(1);
+    }
 }
 
 /// Whether a list makes a view its tables hold once (`VICTORY_LIST_VIEWS=0`:
