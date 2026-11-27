@@ -46,7 +46,7 @@ indirect draws whose arguments sit in renderer patch 1's in-place memory being
 prepared before the title's culling had written them; they are now prepared one at
 a time right before they run (`VICTORY_PORT_CONSTANTS_ORDER`, on by default, about
 2-5 ms). Rooms lit only by bounced light are no longer black with ray tracing
-(`VICTORY_AMBIENT_RT=0.7,1.5`, which `Play-Watched.ps1 -RayTracing` sets).
+(`scripts\play.ps1 -RayTracing -More @{VICTORY_AMBIENT_RT='0.7,1.5'} -Exe <path>`).
 
 Still open: models and textures stay at their lowest detail for a long time while
 the title streams (worst in the intro): the title paces its streaming by its own
@@ -111,18 +111,50 @@ git clone https://github.com/avatarmanz/VIctory-7900XTX
 cd VIctory-7900XTX
 copy victory.example.toml victory.toml      # then set your paths, outside this folder
 cargo build --locked --profile diag -p victory --features diagnostics
+scripts\play.ps1 -WarmupOnly                  # shaders and known pipelines made ahead (below)
 scripts\play.ps1 -Exe <path of your copy's executable>
 ```
 
-`scripts\play.ps1 -Safe` leaves out the newest, faster ways; try it first when
-something is wrong. `-RayTracing` turns the title's ray-traced indirect light on.
+`play.ps1`'s switches go before `-Exe`, which comes last so the path is easy to change:
 
-For PC FSR 4.1.2, set `[paths].fidelityfx_dir` in `victory.toml` or
+| Switch | What it does |
+|---|---|
+| `-Safe` | Leaves out the newest, faster ways; try it first when something is wrong |
+| `-RayTracing` | The title's ray-traced indirect light (`VICTORY_BVH_BUILDER=1`); slow with the Series X profile and no patches (200-500 ms a frame seen), and needed for the phone screen in the intro |
+| `-Fast` | The fastest setup: Series S profile and renderer patches 1, 2, 5, 6 and 7 (with `-Fsr4K` the patches only) |
+| `-Console series-s` / `series-x` | The profile alone, without `-Fast`'s patches |
+| `-Fsr4K quality` / `balanced` / `performance` | PC FidelityFX at 3840×2160 (below) |
+| `-Log run.log` | Also writes everything the runtime logs (frame-rate and A/B lines) to that file |
+| `-More @{VICTORY_X='1'}` | Any other switch |
+| `-WarmupOnly` | Does not start the title: translates every shader of the game into the cache (`victory shaders`), then makes the pipelines earlier runs wrote down (`victory warm`) |
+
+Every run writes down the pipelines the title makes (`VICTORY_PIPELINE_BOOK=1`), so
+the next `-WarmupOnly` can make them ahead. Give `-WarmupOnly` the same switches as
+the runs it is for (`-Fast`, `-RayTracing`, `-More`): some of them are part of the
+shader cache's key, and a warm-up under other switches fills entries those runs never
+read. On an empty cache the first run still misses some draws (faces, for one) while
+shaders translate; run `-WarmupOnly` again after it to make that run's pipelines too.
+
+Builds of different branches need a cache folder each (`[paths].cache_dir` in each
+checkout's `victory.toml`, or `VICTORY_CACHE_DIR`): translations are keyed by the
+translator's version number, which two branches can share while translating
+differently (`VICTORY_SHADER_KEY=source` keys them by the translator's sources
+instead). `victory warm` and `victory shaders` find `victory.toml` in the folder they
+are started from; `play.ps1` always starts them from the checkout's root.
+
+`VICTORY_AB='60,<SWITCH>'` alternates a switch every 60 s within one run, for
+switches read through `crate::ab::pick` only. Renderer patch 2
+(`VICTORY_PORT_DESCRIPTORS`), the profile and the ray-tracing builder act at load:
+compare them in separate runs.
+
+With a FidelityFX folder set, the PC's FSR 4.1.2 also serves the title's own
+FidelityFX calls on every profile, `-Fast`'s Series S too (`VICTORY_FSR_HOST=0`: the
+console's, as before). For PC FSR 4.1.2, set `[paths].fidelityfx_dir` in `victory.toml` or
 `VICTORY_FIDELITYFX_DIR` to the folder containing AMD's signed
 `amd_fidelityfx_upscaler_dx12.dll`. Use the DirectX 12 upscaler in
 `Kits/FidelityFX/signedbin`. [AMD FSR SDK 2.4.0](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/tree/v2.4.0/Kits/FidelityFX/signedbin)
 
-`scripts\play.ps1 -Exe <path> -Fsr4K quality` selects 2560×1440 input for
+`scripts\play.ps1 -Fsr4K quality -Exe <path>` selects 2560×1440 input for
 the retail 1.0.2.1 Series X 4K SDR profile. `balanced` selects 2258×1270
 and `performance` selects 1920×1080. All three output 3840×2160. With
 `victory run` directly, set `VICTORY_FSR_4K` to the preset name.
@@ -137,10 +169,10 @@ name, PCI vendor and device IDs, and dedicated VRAM. Set
 name to select it explicitly. With the launcher, pass
 `-More @{VICTORY_D3D12_ADAPTER='NVIDIA'}`.
 
-Before the first run, ahead of time (both can be stopped and go on later):
+By hand, from the checkout's root (both can be stopped and go on later):
 
 ```powershell
-target\diag\victory.exe shaders <the shader archives>   # every shader translated, minutes
+target\diag\victory.exe shaders                         # every shader of [paths].game_dir translated, minutes
 target\diag\victory.exe warm --used                     # pipelines earlier runs drew with, for a new driver or build
 ```
 

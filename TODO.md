@@ -19,9 +19,10 @@ measured, and the three next steps in order.
 - **The usual test spot:** load the save, escape the prison, then walk to the
   coffee shop. That is about 6 minutes after loading. The glitches show up
   there and in the café cutscene.
-- **How runs are made:**
+- **How runs are made** (`-Exe` last, the owner's preference):
   ```powershell
-  scripts\play.ps1 -Exe '<exe>' -Fast -Log run.log
+  scripts\play.ps1 -WarmupOnly -Fast
+  scripts\play.ps1 -Fast -Log run.log -Exe '<exe>'
   ```
   - `-Fast` gives the Series S profile plus renderer patches 1, 2, 5, 6 and 7.
   - `-Log` tees the runtime's stderr to a file.
@@ -64,26 +65,57 @@ D3D12 call batching does not move it.
 
 ## Step 1: character mesh glitches (top priority)
 
-**Symptom.** Characters' skinned meshes break for single frames:
-- the bag strap shoots off as a long stretched band;
-- a large purple slab appears beside the character;
-- the grey hoodie turns into a black jacket.
+### Update 2026-11-27, later session: compared with Belobug's `a-publier`
 
-The rest of the frame is fine. There is a clip of it (the owner has
-`Glitch.mp4`).
+The owner ran Belobug/VIctory-Belobug-AMD `a-publier` (merge base with
+`personal-build`: cd8dfc0) with `play.ps1 -RayTracing`: Series X profile, no
+renderer patches, builder on. **No glitches**, at under half the frame rate.
+That contradicts "the builder made it worse" above only on its face: that run
+was on our build with `-Fast`.
 
-**Already ruled out:**
-- Our batching commits: `personal-build` before the merge had the glitches.
-- The renderer patches: a run with all five `VICTORY_PORT_*=0` still glitched.
-- The ray-tracing builder: with `VICTORY_BVH_BUILDER=1` the glitches got
-  *worse*. That is the README's known "stray pointers" corruption of moving
-  objects' structures, with 49 warnings of `shaders touched pages that had no
-  copy`.
-- The drops counted as `dropped N without a host pipeline`: all of them are
-  real builder stages, recognised in `pipeline.rs` `of_builder` (53
-  pipelines). They are not misclassified skinning shaders. Their count rises
-  when more characters are on screen, which is a correlation and not the cause.
-- It happens on Series S and Series X alike.
+Both builds then shared one shader cache. Each now has its own
+(`[paths].cache_dir`). On a cold cache some faces are missing on the first run
+only (draws skipped while shaders translate); back on the second. Not a bug.
+
+A read-only audit of every difference between the two branches (8 agents,
+each strong suspect checked by another trying to refute it) found **no code
+difference that explains the glitch**:
+- Shared cache: real hazard (both keyed `version 2`, first writer wins,
+  `shader_cache.rs` `cached_by` serves the other build's entries as "stale"),
+  but the only output difference, Belobug f962387 (`dx.op.getDimensions` kept
+  out of REUSE, an RDNA4 compiler-crash workaround), merges only calls with the
+  same SSA handle and is exact; skinning's raw vertex loads emit no
+  getDimensions (`emit/lower.rs` emits it at 5 sites, none for buffer loads).
+- Ours-only, default-on, absent from Belobug (c18ff12 placed-view padding,
+  c404ee2, 39bf8f6, ee6757a, read-back pool, port RT bits, …): each refuted
+  or rated low; none feeds the skinning landing path.
+- Belobug 4ad8527 (port 2 sync parts disjoint) acts only with
+  `VICTORY_PORT_DESCRIPTORS=1`.
+- The skinning landing path (card steps stage 2, relay, card buffers:
+  `host/card_steps.rs`, `shadow.rs`, `land.rs`, `host/send.rs`) is the same
+  code on both branches.
+
+**Hypothesis now:** a timing race in that shared landing path, hidden by the
+slow configuration (Series X, no patches, builder: 200-500 ms a frame on ours).
+
+Runs that decide it, after `play.ps1 -WarmupOnly <same switches>`:
+1. Ours `-RayTracing -Log pb-rt-1.log` against Belobug's clean run (like for like).
+2. Ours glitches, Belobug not: a real code difference after all. Bisect
+   locally, one cache folder per build: build cd8dfc0 first; clean →
+   `git bisect` cd8dfc0..personal-build; glitched → bisect Belobug's merges.
+3. Both clean: race or configuration. On ours, plain `-Fast` (expected
+   glitch), then `-Fast` with one of `VICTORY_CARD_STEPS='0'`,
+   `VICTORY_RELAY='1'`, `VICTORY_RELAY='0'`, `VICTORY_CARD_BUFFERS='0'`
+   (lead 1 below). The first that clears it names the subsystem.
+
+### What -Fast costs in picture with the builder on
+
+The intro's phone screen shows whenever the builder is on (`-RayTracing`, with
+or without `-Fast`) and is black without it: a ray-tracing matter, not Step 2.
+`-RayTracing` alone looks more accurate than `-RayTracing -Fast`. To find what
+`-Fast` loses: `-RayTracing -Fast` with one `VICTORY_PORT_<X>='0'` per run
+(CONSTANTS, DESCRIPTORS, CBV, GUARD, JOURNAL), and one `-RayTracing -Console
+series-s` (the profile without the patches).
 
 **Leads, in the order to test them:**
 1. **The skinning passes are special to the layer.** The doc comment on
@@ -129,8 +161,18 @@ The code is `crates/victory-gpu/src/descriptor/host.rs`, around the
 - Writes through those views go nowhere today.
 
 Likely visible as: late or wrong textures, the README's "textures appear late
-while the title streams". The wrong eyes and black phone screen without ray
-tracing may also be ray tracing rather than this, so check them separately.
+while the title streams". The black phone screen is ray tracing, not this (it
+shows whenever the builder is on). The wrong eyes are still to be checked.
+
+**Blocked on a log line:** D3D12 gives BC1/BC7 textures no unordered access,
+so mirroring these means a texture of 64/128-bit unsigned blocks (a quarter of
+the size each way) that shaders write, copied into the BC texture after the
+dispatch (and back to title memory as the title expects). Whether that fits
+depends on the view's own format and dimension, words `desc[0..10]` in the
+warning; the owner's logs have them:
+```powershell
+Select-String -Path run.log -Pattern 'placed unordered texture view not mirrored' | Select-Object -First 12
+```
 
 To do:
 - Find who writes those textures and how a placed texture's unordered view
@@ -142,8 +184,10 @@ To do:
 
 - **Remove switches that measured as nothing,** or make them clearly
   experimental:
-  - `VICTORY_UPLOAD_SLICES` is dead under card steps;
-  - `VICTORY_IA_CACHE`;
+  - `VICTORY_UPLOAD_SLICES`: kept, experimental. Its slices only act with
+    card steps below 2, which the Step 1 run `VICTORY_CARD_STEPS='0'` uses;
+    its buffer of zeros acts either way;
+  - `VICTORY_IA_CACHE`: **removed** (3125df6);
   - keep `VICTORY_JOIN_BARRIERS` (it is cheap and may matter once the card is
     the limit) but leave it off.
 
@@ -151,10 +195,12 @@ To do:
 - **DRED:** get one pair of logs, plain `-Fast` against
   `-More @{VICTORY_D3D12_DRED='faults'}`. If `faults` saves 3 ms or more of
   "preparing", make it the `play.ps1` default and keep `light` for crash hunts.
-- **README:** it mentions `Play-Watched.ps1`, which is not in the repo; that
-  came from `main`. Either add the script or point the text at
-  `play.ps1 -RayTracing -More @{VICTORY_AMBIENT_RT='0.7,1.5'}`. Document
-  `-Fast`, `-Log`, the PC FSR on every profile, and the A/B limits above.
+- **README:** done: `Play-Watched.ps1` replaced by the `play.ps1` command;
+  `-Fast`, `-Console`, `-Log`, `-WarmupOnly`, the pipeline book, the PC FSR on
+  every profile, one cache folder per build and the A/B limits documented.
+- **Warm-up:** done: `play.ps1 -WarmupOnly` (shaders, then the pipelines in the
+  book), the pipeline book on by default, `victory warm` says which folder it
+  read and when the book there is empty.
 - **Upstream:** none of this work duplicates an upstream PR. The closest are
   Marvisak/VIctory#1382, #3129, #2215, #2217 and #2818, all open or closed
   without merging. If anything goes upstream, the PC FSR on every profile and
