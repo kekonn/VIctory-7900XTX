@@ -351,8 +351,10 @@ pub(crate) fn missed(index: u32, handle: u64, view: bool, tabled: bool) {
         CHECKED[3].fetch_add(1, Relaxed);
         return;
     }
-    let n = CHECKED[1].fetch_add(1, Relaxed);
-    MISSED_ALL.fetch_add(1, Relaxed);
+    CHECKED[1].fetch_add(1, Relaxed);
+    // Said by the count since the start: `CHECKED` starts over with each
+    // frame line, which said up to 20 of them every five seconds.
+    let n = MISSED_ALL.fetch_add(1, Relaxed);
     let rip = a.writers.get(((handle - a.start) >> 16) as usize).map_or(0, |w| w.load(Relaxed));
     let (base, size) = (IMAGE[0].load(Relaxed), IMAGE[1].load(Relaxed));
     let writer = if rip >= base && rip < base + size { format!("title+{:#x}", rip - base) } else if rip != 0 { format!("{rip:#x} (not the title's)") } else { "not known (no fault on its block)".into() };
