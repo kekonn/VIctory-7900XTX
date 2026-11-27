@@ -37,6 +37,16 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     let done_file = dir.join("warm-done.txt");
     let bad_file = dir.join("warm-bad.txt");
     let keys = known::keys(&dir);
+    println!("pipelines folder: {}", dir.display());
+    if keys.is_empty() {
+        // Nothing to make: say why rather than finishing as if done.
+        println!(
+            "no pipelines written down there yet: runs write them with VICTORY_PIPELINE_BOOK=1 \
+             (scripts\\play.ps1 sets it), into the cache folder their victory.toml names; \
+             run warm from the same folder (or with the same VICTORY_CONFIG / VICTORY_CACHE_DIR)"
+        );
+        return Ok(());
+    }
     let listed = std::fs::read_to_string(&done_file).unwrap_or_default();
     let mut done: HashSet<&str> = HashSet::new();
     for line in listed.lines() {
