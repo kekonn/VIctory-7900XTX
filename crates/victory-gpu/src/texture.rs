@@ -274,15 +274,15 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     // The source's first use in the list records nothing (its prelude
     // brings it to the state); a use in another way since the last copy
     // shows as a change of state.
-    let before = list.transition(source, COPY_SOURCE).map(|(texture, before)| {
-        let state = crate::host::legal_state(texture, COPY_SOURCE);
+    let before = list.transition(source, COPY_SOURCE).map(|(texture, before, state)| {
         let barrier = crate::host::transition(
             texture,
             D3D12_RESOURCE_STATES(before as i32),
             D3D12_RESOURCE_STATES(state as i32),
         );
-        // SAFETY: an open list and a live texture.
-        unsafe { list.list.ResourceBarrier(&[barrier]) };
+        // SAFETY: an open list and a live texture (the list's states hold
+        // it).
+        unsafe { list.list.barriers(&[barrier]) };
         before
     });
     if !first && before.is_none() {
@@ -317,7 +317,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     // the footprints and rests in the common state between copies.
     unsafe {
         list.list
-            .ResourceBarrier(&[crate::host::transition(&through.buffer, common, written)]);
+            .barriers(&[crate::host::transition(&through.buffer, common, written)]);
         for (index, (of_written, _)) in through.parts.iter().enumerate() {
             list.list
                 .CopyTextureRegion(&rows(of_written), 0, 0, 0, &part(from, index), None);
@@ -637,14 +637,6 @@ pub(crate) fn forget(resource: usize) {
     if let Some(through) = through.as_mut() {
         through.remove(&resource);
     }
-}
-
-/// Whether `resource`'s host copy takes its contents from title memory:
-/// a texture the host GPU does not render to or write.
-pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
-    const TARGET_DEPTH_UNORDERED: i32 = 0x7;
-    // SAFETY: a live resource.
-    unsafe { texture.GetDesc() }.Flags.0 & TARGET_DEPTH_UNORDERED == 0
 }
 
 /// Registers, once per list, `resource`'s staging buffer so that at submission
@@ -1008,20 +1000,55 @@ pub(crate) fn zeros(list: &HostList, host: &crate::host::Host, texture: &ID3D12R
     let layers = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D { 1 } else { u32::from(d.DepthOrArraySize) };
     let count = u32::from(d.MipLevels) * layers;
     let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
+    let mut rows = vec![0u32; count as usize];
     let mut bytes = 0u64;
     // SAFETY: outputs for `count` subresources.
     unsafe {
-        host.device
-            .GetCopyableFootprints(&d, 0, count, 0, Some(footprints.as_mut_ptr()), None, None, Some(&mut bytes));
+        host.device.GetCopyableFootprints(
+            &d,
+            0,
+            count,
+            0,
+            Some(footprints.as_mut_ptr()),
+            Some(rows.as_mut_ptr()),
+            None,
+            Some(&mut bytes),
+        );
     }
     if bytes == 0 || bytes == u64::MAX {
         return;
     }
-    let Some((buffer, data)) = list.upload(host, bytes) else {
-        return;
+    let buffer = if crate::host::upload_slices() {
+        // Every subresource from the start of the shared buffer of zeros,
+        // which holds the largest of them.
+        let need = footprints
+            .iter()
+            .zip(&rows)
+            .map(|(f, &rows)| u64::from(f.Footprint.RowPitch) * u64::from(rows) * u64::from(f.Footprint.Depth))
+            .max()
+            .unwrap_or(0);
+        let Some(buffer) = host.zero_source(need) else {
+            return;
+        };
+        list.keep(&buffer);
+        for footprint in &mut footprints {
+            footprint.Offset = 0;
+            crate::host::zero_source_used();
+        }
+        buffer
+    } else {
+        let Some((buffer, at, data)) = list.upload(host, bytes) else {
+            return;
+        };
+        // SAFETY: a mapped buffer of `bytes` bytes, just made.
+        unsafe { std::ptr::write_bytes(data, 0, bytes as usize) };
+        // The upload may still be a slice at an offset: A/B can turn the
+        // switch on between the check above and the one in upload.
+        for footprint in &mut footprints {
+            footprint.Offset += at;
+        }
+        buffer
     };
-    // SAFETY: a mapped buffer of `bytes` bytes, just made.
-    unsafe { std::ptr::write_bytes(data, 0, bytes as usize) };
     for (i, footprint) in footprints.iter().enumerate() {
         let to = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: a borrowed pointer the location never releases.
@@ -1083,14 +1110,30 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
                 host.device
                     .GetCopyableFootprints(&d, level, 1, 0, Some(&mut footprint), None, None, Some(&mut bytes));
             }
-            let Some((buffer, data)) = list.upload(host, bytes) else {
+            let buffer = if crate::host::upload_slices() {
+                // From the start of the shared buffer of zeros (one
+                // subresource's footprint starts at 0).
+                host.zero_source(bytes).inspect(|buffer| {
+                    list.keep(buffer);
+                    footprint.Offset = 0;
+                    crate::host::zero_source_used();
+                })
+            } else {
+                list.upload(host, bytes).map(|(buffer, at, data)| {
+                    // SAFETY: a mapped buffer of `bytes` bytes, just made.
+                    unsafe { std::ptr::write_bytes(data, 0, bytes as usize) };
+                    // (A slice at an offset, if A/B turned the switch on
+                    // since the check above.)
+                    footprint.Offset = at;
+                    buffer
+                })
+            };
+            let Some(buffer) = buffer else {
                 // (With the levels that share its tiles, if it is one of
                 // the small ones.)
                 unzeroed |= tiled.with_level(level);
                 continue;
             };
-            // SAFETY: a mapped buffer of `bytes` bytes, just made.
-            unsafe { std::ptr::write_bytes(data, 0, bytes as usize) };
             let to = D3D12_TEXTURE_COPY_LOCATION {
                 // SAFETY: a borrowed pointer the location never releases.
                 pResource: unsafe { std::mem::transmute_copy(texture) },

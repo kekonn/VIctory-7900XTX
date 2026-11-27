@@ -2,7 +2,8 @@
 #   scripts\play.ps1 -Exe <path of your own copy's executable>
 # -Safe         without the newer, faster ways (the first thing to try when something is wrong)
 # -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
-# -Fast         the README's fastest setup: Series S profile, renderer patches 1, 2, 5, 6, 7 (VICTORY_PORT_*)
+# -Fast         the README's fastest setup: Series S profile, renderer patches 1, 2, 5, 6, 7 (VICTORY_PORT_*);
+#               with -Fsr4K only the patches (FSR at 4K needs the Series X profile)
 # -Fsr4K        PC FidelityFX 4.1.2 at 3840x2160 (quality, balanced or performance)
 #               (with a FidelityFX folder set, VICTORY_FIDELITYFX_DIR or victory.toml, the PC's FSR 4.1.2
 #               also replaces the console's on every profile, -Fast's Series S too; VICTORY_FSR_HOST=0: not)
@@ -32,10 +33,10 @@ if ($Safe) {
     $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
 }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
-if ($Fsr4K) { $settings.VICTORY_FSR_4K = $Fsr4K.ToLowerInvariant() }
 if ($Fast) {
     foreach ($k in 'CONSTANTS', 'DESCRIPTORS', 'CBV', 'GUARD', 'JOURNAL') { $settings["VICTORY_PORT_$k"] = '1' }
 }
+if ($Fsr4K) { $settings.VICTORY_FSR_4K = $Fsr4K.ToLowerInvariant() }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
 $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"
@@ -56,7 +57,11 @@ $Exe = (Resolve-Path $Exe).Path
 # (Relative to where it was started from, not the folder the run goes to.)
 if ($Log) { $Log = [IO.Path]::GetFullPath([IO.Path]::Combine((Get-Location).Path, $Log)); $env:NO_COLOR = '1' }
 $runArgs = @('run', $Exe, '--execute')
-if ($Fast) { $runArgs += '--console', 'series-s' }
+if ($Fast -and $Fsr4K) {
+    Write-Host "-Fast with -Fsr4K: renderer patches on, but the Series X profile stays (FSR at 4K needs it)."
+} elseif ($Fast) {
+    $runArgs += '--console', 'series-s'
+}
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
 try {
     if ($Log) {

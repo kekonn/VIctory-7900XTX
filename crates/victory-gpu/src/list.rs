@@ -726,13 +726,13 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             // shortcut: whole resources, from the state the list tracked
             // (`HostList::transition`); subresources are not told apart.
             let wanted = crate::host::texture_state(b.last as u32);
-            let (texture, before) = list.transition(b.first, wanted)?;
+            let (texture, before, after) = list.transition(b.first, wanted)?;
             Some(Barrier {
                 kind: 0,
                 flags: 0,
                 first: texture.as_raw().cast_const().cast(),
                 second: 0xffff_ffff | (u64::from(before) << 32),
-                last: u64::from(crate::host::legal_state(texture, wanted)),
+                last: u64::from(after),
             })
         }
         1 => Some(Barrier {
@@ -822,8 +822,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
 #[cfg(windows)]
 pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: u32) {
     use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
-    if let Some((texture, before)) = list.transition(resource, state) {
-        let state = crate::host::legal_state(texture, state);
+    if let Some((texture, before, state)) = list.transition(resource, state) {
         let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
         // SAFETY: an open list and a live texture (the list's states hold
         // it).
@@ -909,10 +908,11 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
         let Some(list) = host_list(this) else {
             return;
         };
-        if let (Some(to), Some(from)) = (
+        if let (Some(to), Some(source)) = (
             crate::resource::host_resource(dst),
-            crate::resource::host_resource(src),
+            crate::resource::host_held(src),
         ) {
+            let from = &source.texture;
             if unlike(dst, src) {
                 return;
             }
@@ -929,7 +929,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             let same = windows::core::Interface::as_raw(to) == windows::core::Interface::as_raw(from);
             // A source the title fills itself is uploaded first (upstream
             // PR #671): a copy read whatever the host texture held.
-            if crate::texture::title_written(from) {
+            if source.title_written() {
                 crate::texture::upload(list, src, from);
             }
             // Depth textures shaders also write: what they wrote, first.
@@ -1007,7 +1007,7 @@ extern "system" fn copy_texture_region(
         else {
             return;
         };
-        let Some(to) = crate::resource::host_resource(dst.resource) else {
+        let Some(destination) = crate::resource::host_held(dst.resource) else {
             // Texture to buffer: a read back. The list copies the texels
             // into a host buffer of ours; once it has run they go to the
             // title's buffer (`HostList::defer_read_back`).
@@ -1041,6 +1041,7 @@ extern "system" fn copy_texture_region(
             }
             return;
         };
+        let to = &destination.texture;
         if unlike(dst.resource, src.resource) {
             return;
         }
@@ -1057,32 +1058,33 @@ extern "system" fn copy_texture_region(
             let Some(data) = buffer_range(src.resource, src.footprint.offset, bytes) else {
                 return;
             };
-            let buffer = match list.place_source(data as usize, bytes as usize) {
+            let (buffer, at) = match list.place_source(data as usize, bytes as usize) {
                 // What shaders wrote to it, at this place of the list.
-                Some(buffer) => buffer,
+                Some(buffer) => (buffer, 0),
                 None => {
-                    let Some((buffer, staging)) = list.upload(host, bytes) else {
+                    let Some((buffer, at, staging)) = list.upload(host, bytes) else {
                         return;
                     };
-                    // The list owns this mapped D3D12 upload buffer. Wine can
+                    // The list owns this mapped D3D12 upload memory. Wine can
                     // report its address as MEM_FREE, so use the host-upload
                     // path.
                     list.defer_fill_buffer(&buffer, staging, data, bytes as usize);
-                    buffer
+                    (buffer, at)
                 }
             };
             from.resource = buffer.as_raw().cast_const().cast();
-            from.footprint.offset = 0;
+            from.footprint.offset = at;
             #[cfg(feature = "diagnostics")]
             {
                 // SAFETY: a live buffer.
-                read = Some((unsafe { buffer.GetGPUVirtualAddress() }, bytes));
+                read = Some((unsafe { buffer.GetGPUVirtualAddress() } + at, bytes));
             }
             _upload = buffer;
         } else {
-            let Some(texture) = crate::resource::host_resource(src.resource) else {
+            let Some(source) = crate::resource::host_held(src.resource) else {
                 return;
             };
+            let texture = &source.texture;
             // The same subresource of one host texture on both sides (two
             // title textures over one memory): not a copy the host allows.
             // The states and the copy are left out below; the rest is
@@ -1092,7 +1094,7 @@ extern "system" fn copy_texture_region(
                 && dst.kind != FOOTPRINT
                 && src.footprint.offset as u32 == dst.footprint.offset as u32;
             list.twin_use(src.resource, false, false);
-            if crate::texture::title_written(texture) {
+            if source.title_written() {
                 crate::texture::upload(list, src.resource, texture);
             }
             if !same {
@@ -1120,7 +1122,7 @@ extern "system" fn copy_texture_region(
             Ok("title") => 1,
             _ => 2,
         });
-        if over != 0 && crate::texture::title_written(to) && !crate::texture::host_wrote(dst.resource as usize) {
+        if over != 0 && destination.title_written() && !crate::texture::host_wrote(dst.resource as usize) {
             // One a list uploaded, or a draw sampled, holds the title's.
             if over == 2 && !list.used(dst.resource as usize) && !crate::texture::is_staged(dst.resource) {
                 if let Some(host) = crate::host::host() {
@@ -1222,12 +1224,13 @@ fn read_back(
     // The title's buffer holds every row at its own pitch.
     let bytes = pitch * (rows - 1) + row;
     let data = buffer_range(dst.resource, dst.footprint.offset, bytes).ok_or("a destination outside its buffer")?;
-    let texture = crate::resource::host_resource(src.resource).ok_or("no host texture")?;
+    let source = crate::resource::host_held(src.resource).ok_or("no host texture")?;
+    let texture = &source.texture;
     let buffer = host.read_back_buffer(size).ok_or("no read-back buffer")?;
     // As a texture source of any copy: what shaders wrote to a depth twin
     // and what the title wrote itself first, then the state.
     list.twin_use(src.resource, false, false);
-    if crate::texture::title_written(texture) {
+    if source.title_written() {
         crate::texture::upload(list, src.resource, texture);
     }
     ensure_state(list, src.resource, COPY_SOURCE);
@@ -1377,9 +1380,9 @@ extern "system" fn clear_rtv(
         let rtv = host.rtv(Some(texture), record.desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
-            if let Some((_, before)) = list.transition(record.resource, RENDER_TARGET) {
+            if let Some((_, before, _)) = list.transition(record.resource, RENDER_TARGET) {
                 use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
-                list.list.ResourceBarrier(&[crate::host::transition(
+                list.list.barriers(&[crate::host::transition(
                     texture,
                     State(before as i32),
                     State(RENDER_TARGET as i32),

@@ -439,6 +439,37 @@ fn argument_copies(first: &std::sync::Arc<crate::shadow::Shadow>) -> Vec<(u64, I
     live.iter().map(|s| (s.id(), s.buffer.clone())).collect()
 }
 
+/// Whether a draw leaves out setting the host list's vertex buffers or
+/// index buffer when the views, as the host sees them (host copy address,
+/// bytes, stride or format), are the ones the list was last given. The
+/// host copies are still found and brought up to date for every draw; a
+/// new host list after a cut ([`State::replay`]), a reset and the
+/// expanded rectangles' own vertex buffers start over. Counted on the
+/// frame-rate line ([`ia_line`]). `VICTORY_IA_CACHE=1`: on. Off by
+/// default; A/B-able with `VICTORY_AB=<s>,VICTORY_IA_CACHE`.
+fn ia_cache() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_IA_CACHE") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_IA_CACHE").is_some_and(|v| v == "1"))
+}
+
+/// Vertex buffer and index buffer calls left out ([`ia_cache`]).
+static IA_SKIPPED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// For the frame-rate line, with [`ia_cache`]: the vertex buffer and index
+/// buffer calls left out per frame since the last one.
+pub(crate) fn ia_line(frames: f64) {
+    let [vertex, index] = [0, 1].map(|i| IA_SKIPPED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    if vertex + index > 0.0 {
+        tracing::info!(
+            "input buffer calls per frame (VICTORY_IA_CACHE): {vertex:.0} vertex buffer calls and {index:.0} index buffer calls left out"
+        );
+    }
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -468,6 +499,11 @@ pub(crate) struct State {
     /// it has any ([`State::set_targets`]): per view the host texture (0:
     /// a null view) and what its descriptor says.
     host_targets: Option<(Vec<TargetKey>, Option<TargetKey>)>,
+    /// The vertex buffer views and the index buffer view the host list was
+    /// last given by a draw, as the host sees them ([`ia_cache`]): none
+    /// once something else may have set them.
+    host_vertex: Option<([D3D12_VERTEX_BUFFER_VIEW; 32], usize)>,
+    host_index: Option<D3D12_INDEX_BUFFER_VIEW>,
     viewports: Vec<D3D12_VIEWPORT>,
     scissors: Vec<RECT>,
     blend: Option<[f32; 4]>,
@@ -1328,6 +1364,8 @@ impl State {
             self.set_topology(list, self.topology);
         }
         self.host_targets = None;
+        self.host_vertex = None;
+        self.host_index = None;
         if self.targets_set {
             let handles = std::mem::take(&mut self.target_handles);
             self.set_targets(list, &handles, self.depth_handle);
@@ -1553,10 +1591,16 @@ impl State {
                 StrideInBytes: v.stride,
             };
         }
-        // SAFETY: an open list; the views name live host buffers.
-        unsafe {
-            if count > 0 {
-                l.IASetVertexBuffers(0, Some(&views[..count]));
+        // The host copies are found and brought up to date above for every
+        // draw; only the call that names the same views again is left out.
+        let cache = ia_cache();
+        if count > 0 {
+            if cache && self.host_vertex.as_ref().is_some_and(|(v, n)| v[..*n] == views[..count]) {
+                IA_SKIPPED[0].fetch_add(1, Ordering::Relaxed);
+            } else {
+                // SAFETY: an open list; the views name live host buffers.
+                unsafe { l.IASetVertexBuffers(0, Some(&views[..count])) };
+                self.host_vertex = Some((views, count));
             }
         }
         if indexed {
@@ -1570,8 +1614,13 @@ impl State {
                 SizeInBytes: v.size.min(u32::try_from(shadow.left(v.address)).unwrap_or(u32::MAX)),
                 Format: DXGI_FORMAT(v.format as i32),
             };
-            // SAFETY: an open list; the view names a live host buffer.
-            unsafe { l.IASetIndexBuffer(Some(&view)) };
+            if cache && self.host_index == Some(view) {
+                IA_SKIPPED[1].fetch_add(1, Ordering::Relaxed);
+            } else {
+                // SAFETY: an open list; the view names a live host buffer.
+                unsafe { l.IASetIndexBuffer(Some(&view)) };
+                self.host_index = Some(view);
+            }
         }
         const RENDER_TARGET: u32 = 0x4;
         for &t in &self.targets {
@@ -2662,8 +2711,9 @@ impl State {
                     continue;
                 }
             };
-            let texture = crate::resource::host_resource(resource);
-            let title_fills = texture.is_some_and(crate::texture::title_written);
+            let held = crate::resource::host_held(resource);
+            let texture = held.map(|h| &h.texture);
+            let title_fills = held.is_some_and(crate::resource::HostTexture::title_written);
             if !title_fills {
                 at_once();
                 // a render target, a depth or unordered access texture: the host's own
@@ -3659,6 +3709,11 @@ impl State {
                 self.recording = NEXT.fetch_add(1, Ordering::Relaxed);
             }
             let recording = self.recording;
+            // Its copies of views made before in the list go together, at
+            // the end of the table (VICTORY_TABLE_GATHER).
+            if list_views {
+                crate::descriptor::host::gather_begin();
+            }
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -3722,13 +3777,13 @@ impl State {
                                 None => crate::port_cbv::copied(true),
                             }
                         }
-                        let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
+                        let Some((buffer, gpu, at, to)) = list.scratch_held(u64::from(size)) else {
                             host.make_null(index);
                             continue;
                         };
                         let slot = (std::ptr::from_ref(heap) as usize, index);
                         list.defer_constants(to, address as *const u8, size as usize, slot);
-                        host.constant_at(index, &buffer, gpu, size);
+                        host.constant_at(index, &buffer, gpu, at, size);
                     }
                     Some(view) => {
                         host.make_at(index, &view);
@@ -3759,6 +3814,9 @@ impl State {
                         }
                     }
                 }
+            }
+            if list_views {
+                crate::descriptor::host::gather_end();
             }
             made.push((slot, first * 32));
         }
@@ -3878,8 +3936,10 @@ impl State {
     }
 
     /// Binds vertex buffers holding the rectangles of vertices `first..first
-    /// + count` as triangles, made when the list is submitted.
-    fn rectangles(&self, list: &HostList, count: u32, first: u32) -> bool {
+    /// + count` as triangles, made when the list is submitted. The host
+    /// list's vertex buffers are then not the ones [`State::prepare`] set.
+    fn rectangles(&mut self, list: &HostList, count: u32, first: u32) -> bool {
+        self.host_vertex = None;
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             return false;
         };

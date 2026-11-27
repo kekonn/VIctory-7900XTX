@@ -43,10 +43,17 @@ pub(crate) struct Host {
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
     event: HANDLE,
+    /// A ring of render target views. Only held, so that `rtv_start` stays
+    /// good: [`Host::rtv`] works from the start taken once when the heap was
+    /// made, with no call into the driver for it. The same for `dsvs`.
+    #[allow(dead_code)]
     rtvs: ID3D12DescriptorHeap,
+    rtv_start: usize,
     rtv_size: u32,
     /// A ring of depth views, used as `rtvs`.
+    #[allow(dead_code)]
     dsvs: ID3D12DescriptorHeap,
+    dsv_start: usize,
     dsv_size: u32,
     next_dsv: AtomicU32,
     /// With `VICTORY_D3D12_DEBUG` set (diagnostics builds): the debug
@@ -1093,6 +1100,7 @@ fn create() -> windows::core::Result<Host> {
                 NumDescriptors: RTV_RING,
                 ..Default::default()
             })?;
+        let rtv_start = rtvs.GetCPUDescriptorHandleForHeapStart().ptr;
         let rtv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
         let dsvs: ID3D12DescriptorHeap =
             device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
@@ -1100,6 +1108,7 @@ fn create() -> windows::core::Result<Host> {
                 NumDescriptors: RTV_RING,
                 ..Default::default()
             })?;
+        let dsv_start = dsvs.GetCPUDescriptorHandleForHeapStart().ptr;
         let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
         let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
@@ -1122,8 +1131,10 @@ fn create() -> windows::core::Result<Host> {
             submitted: Mutex::new(0),
             event,
             rtvs,
+            rtv_start,
             rtv_size,
             dsvs,
+            dsv_start,
             dsv_size,
             next_dsv: AtomicU32::new(0),
             messages,
@@ -2003,10 +2014,13 @@ impl Drop for Counted {
 }
 
 /// A chunk of upload memory for lists' scratch data: the buffer, its
-/// mapping.
+/// mapping and its host address, taken once when the chunk is made (a
+/// table's constant buffers asked the driver for it some 23,000 times a
+/// frame).
 struct Chunk {
     buffer: ID3D12Resource,
     data: usize,
+    gpu: u64,
 }
 
 // SAFETY: a D3D12 resource (free-threaded) and its persistent mapping,
@@ -2102,9 +2116,12 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
     name(&buffer, || "list scratch".into());
     ALIVE[1].fetch_add(1, Ordering::Relaxed);
     ALIVE[2].fetch_add(size, Ordering::Relaxed);
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     Some(Chunk {
         buffer,
         data: data as usize,
+        gpu,
     })
 }
 
@@ -2160,6 +2177,223 @@ fn trim_spare_chunks() {
     ALIVE[3].fetch_sub(count, Ordering::Relaxed);
     ALIVE[4].fetch_sub(bytes, Ordering::Relaxed);
     drop(freed);
+}
+
+/// Whether the read-back buffers of the textures copied back into title
+/// memory ([`crate::texback`]) are kept for the next list: each is mapped
+/// once and stays mapped, and goes back when the list that copied into it
+/// is reset or dropped, when the card is done with it (not when its texels
+/// land: that can be skipped, or come again). Before, every list that
+/// wrote the ocean's textures made, mapped, unmapped and freed a buffer for
+/// each of them, some four a list, every frame.
+/// `VICTORY_READBACK_POOL=0`: a buffer made for each copy and mapped when
+/// it lands, as before. On by default; A/B-able with
+/// `VICTORY_AB=<s>,VICTORY_READBACK_POOL`.
+pub(crate) fn read_back_pool() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_READBACK_POOL") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_READBACK_POOL").is_none_or(|v| v != "0"))
+}
+
+/// The most bytes of read-back buffers kept while no list holds them.
+const READ_BACK_MOST: u64 = 8 << 20;
+
+/// A read-back buffer of `size` bytes, and its mapping: 0 if it was made
+/// without the pool ([`read_back_pool`]) and is mapped only when read.
+pub(crate) struct ReadBack {
+    pub(crate) buffer: ID3D12Resource,
+    pub(crate) data: usize,
+    size: u64,
+}
+
+// SAFETY: a D3D12 resource (free-threaded) and its persistent mapping,
+// read only once the list that wrote it has run.
+unsafe impl Send for ReadBack {}
+
+/// Read-back buffers no list holds, mapped.
+static READ_BACK_SPARE: Mutex<Spare<ReadBack>> = Mutex::new(Spare::new());
+
+/// Since the last frame-rate line: read-back buffers taken from those kept,
+/// and made.
+static READ_BACK_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+impl Host {
+    /// A read-back buffer of `size` bytes for a texture copied back: one
+    /// kept ([`READ_BACK_SPARE`]) or a new one, mapped with the pool.
+    pub(crate) fn take_read_back(&self, size: u64) -> Option<ReadBack> {
+        if !read_back_pool() {
+            return Some(ReadBack { buffer: self.read_back_buffer(size)?, data: 0, size });
+        }
+        if let Some(back) = READ_BACK_SPARE.lock().unwrap_or_else(|e| e.into_inner()).take(size) {
+            READ_BACK_STATS[0].fetch_add(1, Ordering::Relaxed);
+            return Some(back);
+        }
+        let buffer = self.read_back_buffer(size)?;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: our read-back buffer; the mapping lasts as long as it.
+        if unsafe { buffer.Map(0, None, Some(&mut data)) }.is_err() || data.is_null() {
+            return None;
+        }
+        name(&buffer, || "texture read-back".into());
+        READ_BACK_STATS[1].fetch_add(1, Ordering::Relaxed);
+        Some(ReadBack { buffer, data: data as usize, size })
+    }
+}
+
+/// The list that copied into `back` was reset or dropped, so the card is
+/// done with it: kept for the next list, or unmapped and freed past
+/// [`READ_BACK_MOST`] and without the pool.
+pub(crate) fn give_read_back(back: ReadBack) {
+    if back.data == 0 {
+        return;
+    }
+    let size = back.size;
+    let back = if read_back_pool() {
+        READ_BACK_SPARE.lock().unwrap_or_else(|e| e.into_inner()).give(back, size, READ_BACK_MOST)
+    } else {
+        Some(back)
+    };
+    // Freed outside the lock.
+    if let Some(back) = back {
+        // SAFETY: mapped when it was made.
+        unsafe { back.buffer.Unmap(0, None) };
+    }
+}
+
+/// For the frame-rate line, with [`read_back_pool`]: the read-back buffers
+/// of textures copied back that were taken from those kept, and made, per
+/// frame since the last one.
+fn read_back_line(frames: f64) {
+    let [kept, made] = [0, 1].map(|i| READ_BACK_STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    if kept + made > 0.0 {
+        tracing::info!(
+            "texture read-back buffers per frame (VICTORY_READBACK_POOL): {kept:.1} taken from those kept, {made:.1} made"
+        );
+    }
+}
+
+/// Whether a list's upload memory is cut from its scratch chunks and its
+/// zeros come from one shared buffer. An upload of up to a chunk's bytes
+/// ([`HostList::upload`]) is a slice of the list's scratch chunks, 512-byte
+/// aligned as a placed footprint must be, instead of a committed upload
+/// buffer made, made resident and mapped for that one copy. The zeros
+/// written into a texture before the title's first copy into it
+/// ([`crate::texture::zeros`]), and into a new level of a texture made level
+/// by level ([`crate::texture::card_writes`]), are copied from one buffer on
+/// the card that D3D12 zeroed when it made it and that nothing writes
+/// ([`Host::zero_source`]), instead of from an upload buffer made and
+/// filled with zeros for the whole chain of levels. With
+/// `VICTORY_CARD_STEPS=2` uploads stay buffers of their own, which the card
+/// may fill. `VICTORY_UPLOAD_SLICES=1`: on. Off by default; A/B-able with
+/// `VICTORY_AB=<s>,VICTORY_UPLOAD_SLICES`.
+pub(crate) fn upload_slices() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_UPLOAD_SLICES") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_UPLOAD_SLICES").is_some_and(|v| v == "1"))
+}
+
+/// The alignment of a placed footprint in a buffer
+/// (`D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT`), which upload slices keep.
+const PLACEMENT_ALIGN: u64 = 512;
+
+/// The shared buffer of zeros ([`Host::zero_source`]) and its bytes.
+struct ZeroSource(Option<(ID3D12Resource, u64)>);
+
+// SAFETY: a D3D12 resource, free-threaded, that nothing writes.
+unsafe impl Send for ZeroSource {}
+
+static ZERO_SOURCE: Mutex<ZeroSource> = Mutex::new(ZeroSource(None));
+
+/// Since the last frame-rate line, with [`upload_slices`]: copies recorded
+/// from the shared buffer of zeros, and uploads cut from scratch chunks.
+static SLICE_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+impl Host {
+    /// A buffer on the card of at least `need` bytes that holds zeros
+    /// ([`upload_slices`]), for copies into textures. D3D12 zeroes a
+    /// committed resource it makes without `CREATE_NOT_ZEROED`, and nothing
+    /// writes this one after, so lists already running may read it while
+    /// others record copies from it. It only grows: a larger one replaces
+    /// it, and the old one lives on in the lists that named it. Every
+    /// footprint copied from it starts at its offset 0, so it holds the
+    /// largest subresource asked for, not a chain of them. The caller's
+    /// list holds the buffer until it is reset (`HostList::keep`).
+    pub(crate) fn zero_source(&self, need: u64) -> Option<ID3D12Resource> {
+        let mut source = ZERO_SOURCE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((buffer, size)) = &source.0
+            && *size >= need
+        {
+            return Some(buffer.clone());
+        }
+        let size = need.max(1 << 16).checked_next_power_of_two()?;
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a device-local buffer. Made resident
+        // (and so zeroed) at once: not with `not_resident`.
+        let made = unsafe {
+            self.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut buffer,
+            )
+        };
+        let made = made.and_then(|()| mapped(&self.device));
+        let buffer = match (made, buffer) {
+            (Ok(()), Some(buffer)) => buffer,
+            (Err(e), _) => {
+                tracing::warn!(error = %e, size, "no buffer of zeros");
+                return None;
+            }
+            (Ok(()), None) => return None,
+        };
+        #[cfg(feature = "diagnostics")]
+        crate::book::made(&buffer, || "the buffer of zeros".into());
+        name(&buffer, || format!("zeros {size:#x}"));
+        source.0 = Some((buffer.clone(), size));
+        Some(buffer)
+    }
+}
+
+/// For the frame-rate line, with [`upload_slices`]: copies from the shared
+/// buffer of zeros, and uploads cut from scratch chunks, per frame since
+/// the last one.
+fn slice_line(frames: f64) {
+    let [zeros, slices] = [0, 1].map(|i| SLICE_STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    if zeros + slices > 0.0 {
+        tracing::info!(
+            "upload slices per frame (VICTORY_UPLOAD_SLICES): {zeros:.1} copies from the buffer of zeros, {slices:.1} uploads cut from scratch chunks"
+        );
+    }
+}
+
+/// Counts a copy recorded from the shared buffer of zeros.
+pub(crate) fn zero_source_used() {
+    SLICE_STATS[0].fetch_add(1, Ordering::Relaxed);
 }
 
 /// What the host keeps for copies in the card's own memory
@@ -2443,6 +2677,9 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// The buffers between copies taken from the pool for this recording
+    /// ([`place::Between`]), given back when the list is reset or dropped.
+    betweens: Vec<place::Between>,
     /// The pipelines [`HostList::bind_pipeline`] kept, by address.
     bound: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// Buffer ranges refreshed since the last title copy (host copy,
@@ -3869,6 +4106,7 @@ fn late_line(frames: f64) {
             t[3],
         );
     }
+    place::between_line(frames);
     card_steps::log(frames);
     crate::port::log(frames);
     crate::port_cbv::log(frames);
@@ -6453,8 +6691,9 @@ impl Host {
         // SAFETY: a slot of our heap and a live resource, or none with a
         // description (a typed null view).
         unsafe {
-            let mut handle = self.rtvs.GetCPUDescriptorHandleForHeapStart();
-            handle.ptr += (slot * self.rtv_size) as usize;
+            let handle = D3D12_CPU_DESCRIPTOR_HANDLE {
+                ptr: self.rtv_start + (slot * self.rtv_size) as usize,
+            };
             self.device
                 .CreateRenderTargetView(resource, desc.map(|d| d as *const _), handle);
             handle
@@ -6470,8 +6709,9 @@ impl Host {
         let slot = self.next_dsv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
         // SAFETY: a slot of our heap and a live resource.
         unsafe {
-            let mut handle = self.dsvs.GetCPUDescriptorHandleForHeapStart();
-            handle.ptr += (slot * self.dsv_size) as usize;
+            let handle = D3D12_CPU_DESCRIPTOR_HANDLE {
+                ptr: self.dsv_start + (slot * self.dsv_size) as usize,
+            };
             self.device
                 .CreateDepthStencilView(resource, desc.map(|d| d as *const _), handle);
             handle
@@ -6667,14 +6907,15 @@ impl HostList {
     }
 
     /// Moves a title texture's host copy to `wanted` (a host state) in this
-    /// list: the host texture and the state it leaves, if that is a change.
-    /// The list's first use of a texture records nothing: its prelude brings
-    /// the texture there at submission.
+    /// list: the host texture, the state it leaves and the state it goes to
+    /// (`wanted` without what the texture's flags forbid, [`legal_for`]), if
+    /// that is a change. The list's first use of a texture records nothing:
+    /// its prelude brings the texture there at submission.
     pub(crate) fn transition(
         &self,
         resource: crate::object::This,
         wanted: u32,
-    ) -> Option<(&'static ID3D12Resource, u32)> {
+    ) -> Option<(&'static ID3D12Resource, u32, u32)> {
         let copy = crate::resource::host_copy(resource)?;
         // SAFETY: as in `crate::resource::host_resource`; the list's states
         // hold the copy from here on.
@@ -6692,7 +6933,7 @@ impl HostList {
                 if before != wanted {
                     self.changed_something();
                 }
-                (before != wanted).then_some((texture, before))
+                (before != wanted).then_some((texture, before, wanted))
             }
         }
     }
@@ -6722,8 +6963,9 @@ impl HostList {
                 D3D12_RESOURCE_STATES(before as i32),
                 D3D12_RESOURCE_STATES(wanted as i32),
             );
-            // SAFETY: an open list and a live texture.
-            unsafe { self.list.ResourceBarrier(&[barrier]) };
+            // SAFETY: an open list and a live texture (the list's states
+            // hold it).
+            unsafe { self.list.barriers(&[barrier]) };
         }
     }
 
@@ -7124,6 +7366,7 @@ impl HostList {
             if !(deferred.copies.is_empty()
                 && deferred.uploads.is_empty()
                 && deferred.kept.is_empty()
+                && deferred.betweens.is_empty()
                 && deferred.textures.is_empty()
                 && deferred.writes.is_empty()
                 && deferred.backs.is_empty()
@@ -7313,38 +7556,46 @@ impl HostList {
         self.deferred().writes.push((dst as usize, what, bytes));
     }
 
-    /// A mapped upload buffer of `size` bytes, alive until the list is
-    /// reset.
+    /// `size` bytes of mapped upload memory, alive until the list is
+    /// reset: the buffer, the offset in it (512-byte aligned, as a placed
+    /// footprint must be) and the CPU pointer to that offset.
     ///
-    /// shortcut: one buffer per copy; pool them once uploads are frequent.
-    pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        // With [`card_steps`] the card may be the one that fills it.
+    /// With [`upload_slices`] up to a scratch chunk's bytes are a slice of
+    /// the list's scratch chunks; else, and past that, one buffer per copy.
+    pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
+        // With [`card_steps`] the card may be the one that fills it: a
+        // buffer of its own, as before.
+        if card_steps::stage() <= 1 && size <= SCRATCH_CHUNK && upload_slices() {
+            let (buffer, at, _, data) = self.scratch_at(size, PLACEMENT_ALIGN)?;
+            SLICE_STATS[1].fetch_add(1, Ordering::Relaxed);
+            return Some((buffer, at, data));
+        }
         let (buffer, data) = if card_steps::stage() > 1 { host.shared_buffer(size)? } else { host.upload_buffer(size)? };
         name(&buffer, || format!("list upload {size:#x}"));
         self.deferred().hold_upload(buffer.clone(), size);
-        Some((buffer, data))
+        Some((buffer, 0, data))
     }
 
     /// `len` bytes of upload memory (256-byte aligned) until the list is
     /// reset: the host GPU address and the CPU pointer.
     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
-        let (buffer, at, data) = self.scratch_at(len)?;
-        // SAFETY: a live buffer.
-        Some((unsafe { buffer.GetGPUVirtualAddress() } + at, data))
+        let (_, _, gpu, data) = self.scratch_at(len, 256)?;
+        Some((gpu, data))
     }
 
-    /// [`HostList::scratch`] and the buffer it lies in, for a descriptor
-    /// slot to hold: the slot outlives the list's use of it.
-    pub(crate) fn scratch_held(&self, len: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
-        let (buffer, at, data) = self.scratch_at(len)?;
-        // SAFETY: a live buffer.
-        let gpu = unsafe { buffer.GetGPUVirtualAddress() } + at;
-        Some((buffer, gpu, data))
-    }
-
-    /// [`HostList::scratch`]: the buffer, the offset in it and the CPU
+    /// [`HostList::scratch`], the buffer it lies in, for a descriptor slot
+    /// to hold (the slot outlives the list's use of it), and the offset in
+    /// that buffer: the buffer, the host address, the offset and the CPU
     /// pointer.
-    fn scratch_at(&self, len: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
+    pub(crate) fn scratch_held(&self, len: u64) -> Option<(ID3D12Resource, u64, u64, *mut u8)> {
+        let (buffer, at, gpu, data) = self.scratch_at(len, 256)?;
+        Some((buffer, gpu, at, data))
+    }
+
+    /// [`HostList::scratch`]: the buffer, the offset in it (a multiple of
+    /// `align`, 256 or more and a power of two), the host address of that
+    /// offset and the CPU pointer.
+    fn scratch_at(&self, len: u64, align: u64) -> Option<(ID3D12Resource, u64, u64, *mut u8)> {
         let host = host()?;
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).next_multiple_of(256);
@@ -7352,11 +7603,13 @@ impl HostList {
             let (buffer, data) = host.upload_buffer(len)?;
             name(&buffer, || format!("list scratch {len:#x}"));
             self.deferred().hold_upload(buffer.clone(), len);
-            return Some((buffer, 0, data));
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            return Some((buffer, 0, gpu, data));
         }
         // The chunk in use while `len` fits in what is left of it, else the
         // next one (a list's first chunk may be a small one).
-        while s.current < s.chunks.len() && s.used + len > s.chunks[s.current].1 {
+        while s.current < s.chunks.len() && s.used.next_multiple_of(align) + len > s.chunks[s.current].1 {
             (s.current, s.used) = (s.current + 1, 0);
         }
         if s.current == s.chunks.len() {
@@ -7369,10 +7622,13 @@ impl HostList {
             s.chunks.push((chunk, size));
             s.used = 0;
         }
-        let (data, buffer) = (s.chunks[s.current].0.data, s.chunks[s.current].0.buffer.clone());
-        let at = s.used;
-        s.used += len;
-        Some((buffer, at, (data + at as usize) as *mut u8))
+        let chunk = &s.chunks[s.current].0;
+        let (data, gpu, buffer) = (chunk.data, chunk.gpu, chunk.buffer.clone());
+        // (Every slice is a multiple of 256 bytes long: with 256 this is
+        // where the last one ended.)
+        let at = s.used.next_multiple_of(align);
+        s.used = at + len;
+        Some((buffer, at, gpu + at, (data + at as usize) as *mut u8))
     }
 
     /// The bytes of scratch chunks the list holds now (after a reset:
@@ -8003,6 +8259,42 @@ fn wide_refresh_enabled(setting: Option<&str>, logical_cpus: Option<usize>) -> b
         Some("1") => true,
         Some("0") => false,
         _ => logical_cpus.is_some_and(|n| n >= 4),
+    }
+}
+
+#[cfg(test)]
+mod upload_slice_tests {
+    use super::*;
+
+    #[test]
+    fn upload_slices_are_placement_aligned() {
+        let Some(host) = host() else {
+            return;
+        };
+        let list = host.new_list().unwrap();
+        // A constant's 256 bytes leave the next slice at 256: an upload goes
+        // to 512.
+        let (a, at_a, _, _) = list.scratch_at(100, 256).unwrap();
+        let (b, at_b, gpu_b, data_b) = list.scratch_at(3000, PLACEMENT_ALIGN).unwrap();
+        // The chunk's host address, taken when it was made, is the buffer's.
+        // SAFETY: a live buffer.
+        assert_eq!(gpu_b, unsafe { b.GetGPUVirtualAddress() } + at_b);
+        assert_eq!(at_a % 256, 0);
+        assert_eq!(at_b % PLACEMENT_ALIGN, 0);
+        if a.as_raw() == b.as_raw() {
+            assert!(at_b >= at_a + 256);
+        }
+        // What follows starts past the upload's bytes (rounded to 256).
+        let (c, at_c, _, data_c) = list.scratch_at(64, 256).unwrap();
+        if b.as_raw() == c.as_raw() {
+            assert_eq!(at_c, at_b + 3072);
+            assert_eq!(data_c as usize - data_b as usize, 3072);
+        }
+        // One that does not fit what is left of a chunk goes to the next, at
+        // its start.
+        let (_, at_d, _, _) = list.scratch_at(SCRATCH_CHUNK, PLACEMENT_ALIGN).unwrap();
+        assert_eq!(at_d, 0);
+        list.close();
     }
 }
 
@@ -9419,6 +9711,10 @@ impl Meter {
             card_clock_line(frames, ms);
             upq::line(frames);
             rec::line(frames);
+            read_back_line(frames);
+            slice_line(frames);
+            crate::draw::ia_line(frames);
+            crate::descriptor::host::gather_line(frames);
             #[cfg(feature = "diagnostics")]
             spans::line(frames);
             crate::shadow::back_line(frames);

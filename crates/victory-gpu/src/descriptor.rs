@@ -886,13 +886,14 @@ pub(crate) fn with_view_heap<T>(f: impl FnOnce(&host::HostHeap) -> T) -> Option<
 
 /// Makes dynamic slot `index` of the host heap behind the title heap at
 /// `heap`, if that heap still exists, the constant buffer view of `size`
-/// bytes of `buffer` at `gpu`.
+/// bytes of `buffer` at `gpu`, which is `offset` bytes into it.
 #[cfg(windows)]
 pub(crate) fn constant_slot(
     heap: usize,
     index: u32,
     buffer: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     gpu: u64,
+    offset: u64,
     size: u32,
 ) {
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
@@ -900,7 +901,7 @@ pub(crate) fn constant_slot(
         // SAFETY: registered heaps are live (removed when dropped).
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
     {
-        host.constant_at(index, buffer, gpu, size);
+        host.constant_at(index, buffer, gpu, offset, size);
     }
 }
 

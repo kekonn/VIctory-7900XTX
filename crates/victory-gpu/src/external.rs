@@ -29,10 +29,10 @@ impl Recording<'_> {
 
     /// Prepare aliases, mip uploads and depth twins like a compute SRV.
     pub fn prepare_input(&self, resource: This) -> Option<()> {
-        let texture = crate::resource::host_resource(resource)?;
+        let copy = crate::resource::host_copy(resource)?;
         let aliased = crate::resource::alias_of(resource)
             .is_some_and(|source| crate::texture::alias(self.0, resource, source));
-        if !aliased && crate::texture::title_written(texture) {
+        if !aliased && copy.title_written() {
             crate::texture::upload_from(self.0, resource, 0);
         }
         self.0.twin_use(resource, false, false);

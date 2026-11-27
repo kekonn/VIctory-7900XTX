@@ -858,7 +858,7 @@ impl Host {
                     && *index as usize / 4 % parts == part
                 {
                     // (A heap that is gone: nothing can read the slot.)
-                    crate::descriptor::constant_slot(*heap, *index, &own.between, gpu + op.at, op.len as u32);
+                    crate::descriptor::constant_slot(*heap, *index, &own.between, gpu + op.at, op.at, op.len as u32);
                 }
             }
         });
@@ -1328,7 +1328,7 @@ mod tests {
             // What depends on them: a copy of the first copy, upload memory
             // filled from that, and the first one's bytes copied over.
             b.defer_copy((start + 1_500_000) as *mut u8, (start + HALF + 600) as *const u8, 700);
-            let (staging, staged) = b.upload(host, 4096).unwrap();
+            let (staging, _, staged) = b.upload(host, 4096).unwrap();
             b.defer_fill_buffer(&staging, staged, (start + 1_500_100) as *const u8, 500);
             b.defer_copy((start + HALF + 300) as *mut u8, (start + 8000) as *const u8, 64);
             b.close();

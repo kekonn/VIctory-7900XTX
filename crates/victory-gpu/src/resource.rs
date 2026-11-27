@@ -2378,6 +2378,14 @@ impl HostTexture {
         self.flags
     }
 
+    /// Whether its contents come from title memory: a texture the host GPU
+    /// does not render to or write. Read from the flags kept at creation
+    /// rather than asked of the texture.
+    pub(crate) fn title_written(&self) -> bool {
+        const TARGET_DEPTH_UNORDERED: u32 = 0x7;
+        self.flags & TARGET_DEPTH_UNORDERED == 0
+    }
+
     fn new(texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32) -> HostTexture {
         use std::sync::atomic::Ordering::Relaxed;
         let bytes = host_bytes(&texture);
@@ -2469,6 +2477,13 @@ pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u
 pub(crate) fn host_resource<'a>(
     this: This,
 ) -> Option<&'a windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+    host_held(this).map(|host| &host.texture)
+}
+
+/// [`host_resource`]'s host copy whole, for what it keeps of the texture
+/// (its flags) as well: borrowed for as long, and a use as that is.
+#[cfg(windows)]
+pub(crate) fn host_held<'a>(this: This) -> Option<&'a HostTexture> {
     if this.is_null() {
         return None;
     }
@@ -2478,7 +2493,7 @@ pub(crate) fn host_resource<'a>(
     // `let_go_idle` takes it: only from a texture the title fills, that no
     // list and no slot holds and that nothing asked for in seconds (the
     // asking just made is noted under the same lock).
-    Some(unsafe { &*std::ptr::from_ref(&host.texture) })
+    Some(unsafe { &*std::sync::Arc::as_ptr(&host) })
 }
 
 /// Whether `this` is a valid title resource created by this runtime.
