@@ -2,7 +2,9 @@
 #   scripts\play.ps1 -Exe <path of your own copy's executable>
 # -Safe         without the newer, faster ways (the first thing to try when something is wrong)
 # -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
-# -Fast         the README's fastest setup: Series S profile, renderer patches 1, 2, 5, 6, 7 (VICTORY_PORT_*)
+# -Fast         the README's fastest setup: Series S profile, renderer patches 1, 2, 5, 6, 7 (VICTORY_PORT_*);
+#               with -Fsr4K only the patches (FSR at 4K needs the Series X profile)
+# -Fsr4K        PC FidelityFX 4.1.2 at 3840x2160 (quality, balanced or performance)
 # -Build        target\diag (the default, the build all measurements are of) or target\release
 # -More         other settings: -More @{VICTORY_PANEL='1'}
 # -Log          also write everything the runtime logs (its frame-rate and A/B lines) to that file: -Log ab-1.log
@@ -12,6 +14,7 @@ param(
     [switch]$Safe,
     [switch]$RayTracing,
     [switch]$Fast,
+    [ValidateSet('quality', 'balanced', 'performance')][string]$Fsr4K,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [hashtable]$More = @{},
     [string]$Log
@@ -31,13 +34,14 @@ if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
 if ($Fast) {
     foreach ($k in 'CONSTANTS', 'DESCRIPTORS', 'CBV', 'GUARD', 'JOURNAL') { $settings["VICTORY_PORT_$k"] = '1' }
 }
+if ($Fsr4K) { $settings.VICTORY_FSR_4K = $Fsr4K.ToLowerInvariant() }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
 $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"
 if (-not (Test-Path $victory)) { Write-Host "No $victory. Build it first (README.md)."; exit 1 }
 if (-not (Test-Path $Exe)) { Write-Host "No $Exe."; exit 1 }
 # (Other settings left over in this window go; where your files are stays.)
-$paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR'
+$paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_FIDELITYFX_DIR'
 $inherited = @(Get-ChildItem Env:VICTORY_* | Where-Object { $_.Name -notin $paths })
 foreach ($entry in $inherited) { Remove-Item "Env:$($entry.Name)" }
 foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
@@ -51,7 +55,11 @@ $Exe = (Resolve-Path $Exe).Path
 # (Relative to where it was started from, not the folder the run goes to.)
 if ($Log) { $Log = [IO.Path]::GetFullPath([IO.Path]::Combine((Get-Location).Path, $Log)); $env:NO_COLOR = '1' }
 $runArgs = @('run', $Exe, '--execute')
-if ($Fast) { $runArgs += '--console', 'series-s' }
+if ($Fast -and $Fsr4K) {
+    Write-Host "-Fast with -Fsr4K: renderer patches on, but the Series X profile stays (FSR at 4K needs it)."
+} elseif ($Fast) {
+    $runArgs += '--console', 'series-s'
+}
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
 try {
     if ($Log) {
