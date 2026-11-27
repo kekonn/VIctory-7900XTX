@@ -149,7 +149,7 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 /// Runs `f` with the host list and draw state of a title list, if there
 /// is a host GPU.
 #[cfg(windows)]
-fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
+pub(crate) fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
     let Some(list) = host_list(this) else { return };
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
@@ -202,6 +202,13 @@ pub(crate) struct Detached {
 impl Detached {
     pub(crate) fn host(&self) -> &crate::host::HostList {
         &self.host
+    }
+
+    /// Releases this list's dynamic descriptor slots once its GPU submission
+    /// has completed, without waiting for the full `bury_lag` (64 submissions)
+    /// allocator delay: preventing dynamic slot exhaustion at ~10k draws/frame.
+    pub(crate) fn release_tables(&mut self) {
+        self._state.tables_done();
     }
 }
 
