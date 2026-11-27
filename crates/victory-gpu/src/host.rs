@@ -9713,7 +9713,6 @@ impl Meter {
             rec::line(frames);
             read_back_line(frames);
             slice_line(frames);
-            crate::draw::ia_line(frames);
             crate::descriptor::host::gather_line(frames);
             #[cfg(feature = "diagnostics")]
             spans::line(frames);
