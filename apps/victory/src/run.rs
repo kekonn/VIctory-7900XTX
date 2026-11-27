@@ -39,6 +39,14 @@ fn check_cpu_features() -> Result<()> {
     check_cpu_features_with(has_avx2, skip.as_deref())
 }
 
+/// Whether the PC's FidelityFX, from the folder set for it, serves the
+/// title's own FidelityFX calls outside the 4K profile
+/// (`VICTORY_FSR_HOST=0`: the title's console FSR, as before; on otherwise).
+#[cfg(windows)]
+fn host_fsr_wanted() -> bool {
+    std::env::var_os("VICTORY_FSR_HOST").is_none_or(|v| v != "0")
+}
+
 #[cfg(windows)]
 pub fn run(
     exe: &Path,
@@ -84,6 +92,21 @@ pub fn run(
         let cache = cfg.cache_subdir(&format!("images/fsr-{}-4k-sdr", preset.name()))?;
         victory_loader::load(&prepared, &cache)?
     } else {
+        // The title's own FidelityFX calls (the Series S profile's upscaler,
+        // or any profile's with VICTORY_UPSCALER=7) go to the PC's FSR 4.1.2
+        // when a folder for it is set: the console's FSR 4 runs its passes
+        // through our translator (its precompiled pipelines do not load
+        // here), which speckled and smeared the picture. Without the folder,
+        // or if it does not load, the title's own runs.
+        if host_fsr_wanted()
+            && let Some(dir) = cfg.fidelityfx_dir.as_deref()
+        {
+            // Before the first lookup builds the import registry.
+            match victory_hle::modules::fidelityfx::use_host_dir(dir) {
+                Ok(()) => println!("upscaler       the PC's FidelityFX FSR 4.1.2 for the title's own (VICTORY_FSR_HOST=0: the console's)"),
+                Err(e) => eprintln!("VIctory: FSR 4.1.2 from {}: {e}; the title's own FidelityFX runs", dir.display()),
+            }
+        }
         victory_loader::load(&prepared, &images)?
     };
     // The program is mapped from the copy `load` wrote: the file's bytes
