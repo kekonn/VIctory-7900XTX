@@ -5,6 +5,8 @@
 # -Fast         the README's fastest setup: Series S profile, renderer patches 1, 2, 5, 6, 7 (VICTORY_PORT_*);
 #               with -Fsr4K only the patches (FSR at 4K needs the Series X profile)
 # -Fsr4K        PC FidelityFX 4.1.2 at 3840x2160 (quality, balanced or performance)
+#               (with a FidelityFX folder set, VICTORY_FIDELITYFX_DIR or victory.toml, the PC's FSR 4.1.2
+#               also replaces the console's on every profile, -Fast's Series S too; VICTORY_FSR_HOST=0: not)
 # -Build        target\diag (the default, the build all measurements are of) or target\release
 # -More         other settings: -More @{VICTORY_PANEL='1'}
 # -Log          also write everything the runtime logs (its frame-rate and A/B lines) to that file: -Log ab-1.log
